@@ -223,6 +223,19 @@ class VoiceCommandRouter:
                             "properties": {},
                         },
                     },
+                    {
+                        "name": "analyze_screen",
+                        "description": "Analyze or describe the user's current screen or active window. Call this when the user asks 'Analyze my current screen', 'What am I watching?', 'What video is playing?', or asks about visual screen content.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "query": {
+                                    "type": "STRING",
+                                    "description": "Optional specific question about the screen contents (e.g. 'what video is playing', 'what error is showing').",
+                                },
+                            },
+                        },
+                    },
                 ]
             }
         ]
@@ -253,10 +266,12 @@ class VoiceCommandRouter:
     async def _handle_get_screen_context(self, args: dict[str, Any]) -> dict[str, Any]:
         """Inspect the active screen or window to truthfully describe what user is looking at."""
         try:
-            tracker = get_context_tracker()
-            res = tracker.get_screen_context()
-            logger.info("Screen context: %s", res)
-            return res
+            from futaba.system.screen_provider import get_screen_provider
+            provider = get_screen_provider()
+            query = args.get("query", "")
+            res = await provider.analyze(query=query)
+            logger.info("Screen context: %s", res.summary)
+            return res.to_dict()
         except Exception as e:
             logger.error("get_screen_context failed: %s", e)
             return {
@@ -265,7 +280,9 @@ class VoiceCommandRouter:
                 "details": str(e),
             }
 
+    _handle_analyze_screen = _handle_get_screen_context
     _handle_what_is_on_screen = _handle_get_screen_context
+    _handle_describe_screen = _handle_get_screen_context
 
     async def _handle_open_application(self, args: dict[str, Any]) -> dict[str, Any]:
         """Launch an application or navigate an existing browser on Windows."""
@@ -277,7 +294,9 @@ class VoiceCommandRouter:
         lower_name = app_name.lower()
         screen_indicators = [
             "what am i looking at", "what's on my screen", "what is on my screen",
-            "current window", "active window"
+            "current window", "active window", "analyze my current screen",
+            "analyze the screen", "analyze screen", "what am i watching",
+            "what's playing", "what is playing", "describe my screen", "describe the screen"
         ]
         if any(ind in lower_name for ind in screen_indicators):
             logger.info("Rerouting screen query '%s' from open_application to get_screen_context", app_name)

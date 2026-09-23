@@ -18,6 +18,7 @@ import logging
 import queue
 import threading
 import time
+import uuid
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -37,23 +38,146 @@ OUTPUT_SAMPLE_RATE = 24000    # Gemini Live returns 24kHz PCM
 OUTPUT_CHANNELS = 1           # Mono
 OUTPUT_CHUNK_SIZE = 1024
 
+# Active session invariant tracker across the process
+_active_live_sessions: int = 0
+_global_audio_player: Optional[AudioPlayer] = None
+
+
+def get_audio_player(device: Optional[int | str] = None, sample_rate: int = OUTPUT_SAMPLE_RATE) -> AudioPlayer:
+    """Return the global singleton AudioPlayer instance."""
+    global _global_audio_player
+    if _global_audio_player is None:
+        _global_audio_player = AudioPlayer(device=device, sample_rate=sample_rate)
+    elif device is not None:
+        _global_audio_player.device = device
+    return _global_audio_player
+
 
 class AudioPlayer:
     """
     Realtime streaming PCM audio player using sounddevice.
-    Supports low-latency playback, pre-buffering (jitter smoothing), and clean interruption.
+    Supports low-latency playback, jitter smoothing, unbounded queuing,
+    response generation tracking, and clean interruption.
     """
 
     def __init__(self, device: Optional[int | str] = None, sample_rate: int = OUTPUT_SAMPLE_RATE):
         self.device = device
         self.sample_rate = sample_rate
-        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=100)
+        # Unbounded queue: never drops chunks during fast WebSocket bursts
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=0)
         self._stream = None
         self._running = False
         self._current_chunk = bytearray()
         self._lock = threading.Lock()
         self._prebuffering = True
         self.on_playback_state: Optional[Callable[[bool], None]] = None
+
+        # Turn / Generation metrics
+        self._current_response_id: str = ""
+        self._bytes_received: int = 0
+        self._bytes_played: int = 0
+        self._chunks_received: int = 0
+        self._interrupted: bool = False
+        self._interruption_reason: str = ""
+        self._is_playing: bool = False
+        self._turn_complete_received: bool = False
+        self._last_sample_consumed_time: float = time.monotonic()
+
+    def start_response(self, response_id: Optional[str] = None) -> str:
+        """Start tracking a new audio response turn."""
+        with self._lock:
+            self._current_response_id = response_id or uuid.uuid4().hex[:8]
+            self._bytes_received = 0
+            self._bytes_played = 0
+            self._chunks_received = 0
+            self._interrupted = False
+            self._interruption_reason = ""
+            self._turn_complete_received = False
+            self._is_playing = True
+            self._prebuffering = True
+            self._last_sample_consumed_time = time.monotonic()
+        logger.debug("Audio response started: id=%s", self._current_response_id)
+        if self.on_playback_state:
+            try:
+                self.on_playback_state(True)
+            except Exception as e:
+                logger.debug("Playback state callback error: %s", e)
+        return self._current_response_id
+
+    def mark_turn_complete(self) -> None:
+        """Mark that Gemini Live has finished transmitting chunks for this turn."""
+        with self._lock:
+            self._turn_complete_received = True
+            if self._queue.empty() and not self._current_chunk:
+                self._is_playing = False
+                self._notify_completed()
+
+    def _notify_completed(self) -> None:
+        """Log turn completion and fire on_playback_state(False)."""
+        logger.info(
+            "Audio response completed: id=%s chunks=%d received=%d played=%d interrupted=%s reason=%s",
+            self._current_response_id or "none",
+            self._chunks_received,
+            self._bytes_received,
+            self._bytes_played,
+            self._interrupted,
+            self._interruption_reason or "none",
+        )
+        if self.on_playback_state:
+            try:
+                self.on_playback_state(False)
+            except Exception as e:
+                logger.debug("Playback state callback error: %s", e)
+
+    def is_playing(self) -> bool:
+        """True if player is currently buffering, queue has chunks, or audio is rendering."""
+        with self._lock:
+            return bool(self._is_playing or not self._queue.empty() or self._current_chunk)
+
+    def play_chunk(self, audio_bytes: bytes) -> None:
+        """Queue an audio chunk for streaming playback without dropping."""
+        if not self._running or not audio_bytes:
+            return
+        with self._lock:
+            self._queue.put(audio_bytes)
+            self._bytes_received += len(audio_bytes)
+            self._chunks_received += 1
+            self._is_playing = True
+
+    def check_watchdog(self) -> None:
+        """Watchdog: recover cleanly if sounddevice stalled for > 2.5s while queue has chunks."""
+        now = time.monotonic()
+        with self._lock:
+            stalled = self._is_playing and (not self._queue.empty() or self._current_chunk) and (now - self._last_sample_consumed_time > 2.5)
+        if stalled:
+            logger.warning("Audio playback watchdog: stream stalled >2.5s; resetting jitter buffer")
+            with self._lock:
+                self._prebuffering = False
+                self._last_sample_consumed_time = now
+
+    def interrupt(self, reason: str = "unspecified") -> None:
+        """Immediately stop playback and discard all buffered audio."""
+        with self._lock:
+            was_playing = bool(self._is_playing or not self._queue.empty() or self._current_chunk)
+            self._interrupted = True
+            self._interruption_reason = reason
+            self._current_chunk.clear()
+            while not self._queue.empty():
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+            self._prebuffering = True
+            self._is_playing = False
+            self._turn_complete_received = False
+
+        if was_playing:
+            logger.info("Audio player interrupted (reason=%s, id=%s); buffer cleared.", reason, self._current_response_id)
+            if self.on_playback_state:
+                try:
+                    self.on_playback_state(False)
+                except Exception as e:
+                    logger.debug("Playback state callback error: %s", e)
 
     def start(self) -> bool:
         """Start the audio output stream."""
@@ -68,11 +192,14 @@ class AudioPlayer:
 
                 bytes_needed = frames * 2  # 16-bit mono = 2 bytes per sample
                 output_buf = bytearray()
+                completed = False
 
                 with self._lock:
-                    # Jitter buffer smoothing: wait until 2 chunks arrive before starting stream
+                    self._last_sample_consumed_time = time.monotonic()
+
+                    # Jitter buffer smoothing: wait until 2 chunks arrive or turn finished
                     if self._prebuffering:
-                        if self._queue.qsize() >= 2:
+                        if self._queue.qsize() >= 2 or self._turn_complete_received:
                             self._prebuffering = False
                         else:
                             outdata[:] = np.zeros((frames, 1), dtype=np.int16)
@@ -89,15 +216,22 @@ class AudioPlayer:
                         take = min(needed, len(self._current_chunk))
                         output_buf.extend(self._current_chunk[:take])
                         self._current_chunk = self._current_chunk[take:]
+                        self._bytes_played += take
 
                     if not self._current_chunk and self._queue.empty():
                         self._prebuffering = True
+                        if self._turn_complete_received and self._is_playing:
+                            self._is_playing = False
+                            self._turn_complete_received = False
+                            completed = True
 
                 if len(output_buf) < bytes_needed:
-                    # Fill remainder with silence
                     output_buf.extend(b"\x00" * (bytes_needed - len(output_buf)))
 
                 outdata[:] = np.frombuffer(output_buf, dtype=np.int16).reshape(-1, 1)
+
+                if completed:
+                    self._notify_completed()
 
             self._stream = sd.OutputStream(
                 samplerate=self.sample_rate,
@@ -115,32 +249,6 @@ class AudioPlayer:
             logger.error("Failed to start audio player: %s", e)
             self._running = False
             return False
-
-    def play_chunk(self, audio_bytes: bytes) -> None:
-        """Queue an audio chunk for immediate streaming playback."""
-        if not self._running or not audio_bytes:
-            return
-        try:
-            self._queue.put_nowait(audio_bytes)
-        except queue.Full:
-            # Drop oldest chunk if buffer is overwhelmed to maintain low latency
-            try:
-                self._queue.get_nowait()
-                self._queue.put_nowait(audio_bytes)
-            except Exception:
-                pass
-
-    def interrupt(self, reason: str = "unspecified") -> None:
-        """Immediately stop playback and discard all buffered audio."""
-        with self._lock:
-            self._current_chunk.clear()
-            while not self._queue.empty():
-                try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    break
-            self._prebuffering = True
-        logger.info("Audio player interrupted (reason=%s); buffer cleared.", reason)
 
     def stop(self) -> None:
         """Stop and close the audio output stream."""
@@ -174,7 +282,10 @@ class GeminiLiveVoiceProvider:
         self._running = False
         self._active_session = None
         self._input_stream = None
-        self._player = AudioPlayer()
+        self._player = get_audio_player()
+        self._player.on_playback_state = self._on_playback_state_changed
+        self._local_barge_in_active = False
+        self._last_barge_in_time: float = 0.0
         self._main_task: Optional[asyncio.Task] = None
         self._send_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
         self._state = "idle"
@@ -194,6 +305,15 @@ class GeminiLiveVoiceProvider:
 
         # Lazy wake-word detector for idle phase
         self._wake_detector = None
+
+    def _on_playback_state_changed(self, is_playing: bool) -> None:
+        """Called when AudioPlayer starts or finishes physical audio rendering."""
+        if not is_playing and self._state == "speaking":
+            logger.debug("Playback queue drained; transitioning speaking -> listening")
+            self._set_state("listening", "Futaba listening")
+            now = time.monotonic()
+            self._last_user_voice = now
+            self._last_interaction_time = now
 
     @property
     def is_running(self) -> bool:
@@ -408,6 +528,12 @@ class GeminiLiveVoiceProvider:
         session_id = self._session_count
         session_start = time.monotonic()
 
+        global _active_live_sessions
+        if _active_live_sessions > 0:
+            logger.warning("[Session #%d] Gemini Live session already active (%d). Rejecting duplicate session.", session_id, _active_live_sessions)
+            return
+        _active_live_sessions += 1
+
         client = genai.Client(api_key=api_key)
 
         # System instructions enforcing Futaba personality, continuous assistant behavior,
@@ -484,6 +610,7 @@ class GeminiLiveVoiceProvider:
                 send_task = asyncio.create_task(self._audio_stream_sender(session, audio_queue, session_id))
 
                 try:
+                    turn_active = False
                     # Persistent multi-turn receive loop across the entire session lifecycle
                     while self._running and self._session_active:
                         turn_chunks_received = 0
@@ -495,26 +622,38 @@ class GeminiLiveVoiceProvider:
                             # 1. Check for user interruption of assistant speech (server-side VAD)
                             if chunk.server_content:
                                 if chunk.server_content.interrupted:
-                                    logger.info("[Session #%d] Gemini Live: User interrupted assistant speech (server VAD).", session_id)
-                                    self._player.interrupt(reason="server_vad")
-                                    self._set_state("interrupted", "User interrupted")
+                                    barge_in_confirmed = self._local_barge_in_active or (time.monotonic() - self._last_barge_in_time < 3.0)
+                                    if barge_in_confirmed:
+                                        logger.info("[Session #%d] Gemini Live: User interrupted assistant speech (confirmed barge-in).", session_id)
+                                        self._player.interrupt(reason="user_barge_in")
+                                        self._set_state("interrupted", "User interrupted")
+                                    else:
+                                        logger.info("[Session #%d] Suppressed spurious server VAD interruption (speaker bleed echo; no user barge-in detected).", session_id)
                                     continue
 
                                 # 2. Assistant audio output chunks
                                 turn = chunk.server_content.model_turn
                                 if turn:
-                                    self._set_state("speaking", "Futaba speaking")
+                                    if not turn_active:
+                                        self._player.start_response()
+                                        turn_active = True
+                                        self._set_state("speaking", "Futaba speaking")
+
                                     for part in turn.parts:
                                         if part.inline_data and part.inline_data.data:
                                             self._player.play_chunk(part.inline_data.data)
 
                                 if chunk.server_content.turn_complete:
-                                    logger.debug("[Session #%d] Gemini Live: Turn completed.", session_id)
-                                    self._set_state("listening", "Futaba listening")
-                                    now = time.monotonic()
-                                    self._last_user_voice = now
-                                    self._last_interaction_time = now
-                                    self._engagement_state = "awake"
+                                    logger.debug("[Session #%d] Gemini Live: Server turn completed (waiting for audio drain).", session_id)
+                                    self._player.mark_turn_complete()
+                                    turn_active = False
+                                    # If audio output has already drained, transition immediately to listening
+                                    if not self._player.is_playing():
+                                        self._set_state("listening", "Futaba listening")
+                                        now = time.monotonic()
+                                        self._last_user_voice = now
+                                        self._last_interaction_time = now
+                                        self._engagement_state = "awake"
 
                             # 3. Tool call execution
                             if chunk.tool_call:
@@ -569,6 +708,7 @@ class GeminiLiveVoiceProvider:
             logger.warning("[Session #%d] Gemini Live session closed with error: %s", session_id, e)
             raise
         finally:
+            _active_live_sessions = max(0, _active_live_sessions - 1)
             self._active_session = None
             self._session_active = False
 
@@ -578,11 +718,21 @@ class GeminiLiveVoiceProvider:
         audio_queue: queue.Queue[np.ndarray],
         session_id: int = 0,
     ) -> None:
-        """Stream microphone PCM chunks to Gemini Live WebSocket."""
+        """Stream microphone PCM chunks to Gemini Live WebSocket with speaker bleed suppression."""
         from google.genai import types
+
+        BARGE_IN_THRESHOLD = 140.0
+        BARGE_IN_CONSECUTIVE_FRAMES = 3
+        consecutive_barge_in_frames = 0
+        last_watchdog_check = time.monotonic()
 
         while self._running and self._session_active:
             try:
+                now = time.monotonic()
+                if now - last_watchdog_check > 1.0:
+                    self._player.check_watchdog()
+                    last_watchdog_check = now
+
                 # Gather available chunks from mic
                 chunks = []
                 while not audio_queue.empty():
@@ -592,20 +742,47 @@ class GeminiLiveVoiceProvider:
                     combined = np.concatenate(chunks)
                     pcm_bytes = combined.astype(np.int16).tobytes()
 
-                    # Track user voice activity timestamp
                     energy = np.sqrt(np.mean(combined.astype(np.float64) ** 2))
-                    if energy > 25.0:
-                        now = time.monotonic()
-                        self._last_user_voice = now
-                        if self._engagement_state == "awake":
-                            self._last_interaction_time = now
+                    is_speaking = self._player.is_playing()
 
-                    # Only send realtime input if tool calls are NOT pending and streaming is allowed.
-                    # This prevents Gemini Live protocol violation 1008 during tool execution.
-                    if self._audio_streaming_allowed.is_set() and self._session_active:
-                        await session.send_realtime_input(
-                            audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")
-                        )
+                    if is_speaking:
+                        # Assistant is speaking through the speakers.
+                        # Microphone picks up speaker bleed (typically 20-80 RMS).
+                        # Only send audio to Gemini if user is deliberately shouting / barging in.
+                        if energy > BARGE_IN_THRESHOLD:
+                            consecutive_barge_in_frames += 1
+                            if consecutive_barge_in_frames >= BARGE_IN_CONSECUTIVE_FRAMES:
+                                self._local_barge_in_active = True
+                                self._last_barge_in_time = time.monotonic()
+                                logger.info(
+                                    "[Session #%d] Confirmed user barge-in (energy=%.1f > %.1f across %d frames)",
+                                    session_id, energy, BARGE_IN_THRESHOLD, consecutive_barge_in_frames
+                                )
+                                self._player.interrupt(reason="user_barge_in")
+                                self._set_state("interrupted", "User interrupted")
+                                if self._audio_streaming_allowed.is_set() and self._session_active:
+                                    await session.send_realtime_input(
+                                        audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")
+                                    )
+                        else:
+                            consecutive_barge_in_frames = 0
+                            if time.monotonic() - self._last_barge_in_time > 1.5:
+                                self._local_barge_in_active = False
+                            # Suppress mic audio: do NOT stream speaker bleed into Gemini Live!
+                    else:
+                        consecutive_barge_in_frames = 0
+                        if time.monotonic() - self._last_barge_in_time > 1.5:
+                            self._local_barge_in_active = False
+
+                        if energy > 25.0:
+                            self._last_user_voice = now
+                            if self._engagement_state == "awake":
+                                self._last_interaction_time = now
+
+                        if self._audio_streaming_allowed.is_set() and self._session_active:
+                            await session.send_realtime_input(
+                                audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")
+                            )
 
                 # Check conversational silence timeout in awake state (45 seconds)
                 if self._engagement_state == "awake":

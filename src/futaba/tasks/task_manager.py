@@ -333,7 +333,12 @@ class Task:
         """
         Atomically transition to a new state.
         Raises InvalidTransitionError if the transition is not valid.
+        Self-transitions (state == new_state) are idempotent no-ops.
         """
+        if new_state == self.state:
+            logger.debug("Task %s already in state %s; transition is no-op", self.task_id[:8], new_state.value)
+            return
+
         valid = _VALID_TRANSITIONS.get(self.state, set())
         if new_state not in valid:
             raise InvalidTransitionError(
@@ -824,6 +829,10 @@ class TaskManager:
         """Mark a task as failed."""
         async with self._lock:
             task = self._get_task(task_id)
+            if task.state == TaskState.FAILED:
+                task.error = error
+                self._journal.save(task)
+                return task
             task.error = error
         return await self.transition(task_id, TaskState.FAILED, error)
 

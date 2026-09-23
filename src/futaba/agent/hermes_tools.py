@@ -161,7 +161,7 @@ class HermesComputerUseTool(Tool):
         return [
             "action", "screenshot", "capture", "click", "type", "press_key", "key",
             "scroll", "drag", "inspect_window", "list_windows", "list_apps", "focus_app", "launch_app",
-            "launch", "open_application",
+            "launch", "open_application", "inspect", "analyze", "describe",
         ]
 
     @property
@@ -208,7 +208,16 @@ class HermesComputerUseTool(Tool):
                     pass
             return {"windows": windows, "count": len(windows)}
 
-        elif norm_action in ("capture", "inspect_window", "screenshot", "inspect"):
+        elif norm_action in ("capture", "inspect_window", "screenshot", "inspect", "analyze", "describe"):
+            # Use ScreenContextProvider for safe, crash-proof perception
+            try:
+                from futaba.system.screen_provider import get_screen_provider
+                provider = get_screen_provider()
+                analysis = provider._sync_analyze(window_title)
+                return analysis.to_dict()
+            except Exception as sp_err:
+                logger.debug("Screen provider fallback error: %s; trying pywinauto", sp_err)
+
             desktop = Desktop(backend="uia")
             target_win = None
             clean_title = window_title
@@ -373,6 +382,8 @@ class HermesComputerUseTool(Tool):
             "screenshot": "capture",
             "inspect_window": "capture",
             "inspect": "capture",
+            "analyze": "capture",
+            "describe": "capture",
             "press_key": "key",
             "type_text": "type",
             "left_click": "click",

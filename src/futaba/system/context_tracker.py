@@ -356,30 +356,38 @@ class SystemContextTracker:
                 return {"status": "error", "message": f"Could not launch {target}: {start_err}"}
 
 
-    def get_screen_context(self) -> dict[str, Any]:
+    def get_screen_context(self, query: str = "") -> dict[str, Any]:
         """
         Inspect the active screen/window to provide truthful context for screen questions.
         Prevents hallucinated app launches or blind stalls.
+        Delegates to ScreenContextProvider for safe UIA and multimodal inspection.
         """
-        fg = self.get_foreground_window()
-        title = fg.get("title", "").strip()
-        proc = fg.get("process", "").strip()
-        hwnd = fg.get("hwnd", 0)
+        try:
+            from futaba.system.screen_provider import get_screen_provider
+            provider = get_screen_provider()
+            analysis = provider._sync_analyze(query)
+            return analysis.to_dict()
+        except Exception as e:
+            logger.debug("Screen provider context error: %s; falling back to basic foreground inspection", e)
+            fg = self.get_foreground_window()
+            title = fg.get("title", "").strip()
+            proc = fg.get("process", "").strip()
+            hwnd = fg.get("hwnd", 0)
 
-        if title and title != "Desktop" and title != "Unknown":
-            desc = f"You are currently looking at '{title}' ({proc})."
-        else:
-            desc = "You are currently looking at your Windows desktop with no focused application window."
+            if title and title != "Desktop" and title != "Unknown":
+                desc = f"You are currently looking at '{title}' ({proc})."
+            else:
+                desc = "You are currently looking at your Windows desktop with no focused application window."
 
-        return {
-            "status": "success",
-            "window_title": title or "Desktop",
-            "process_name": proc or "explorer.exe",
-            "hwnd": hwnd,
-            "description": desc,
-            "message": desc,
-            "supports_visual_interaction": True,
-        }
+            return {
+                "status": "success",
+                "window_title": title or "Desktop",
+                "process_name": proc or "explorer.exe",
+                "hwnd": hwnd,
+                "description": desc,
+                "message": desc,
+                "supports_visual_interaction": True,
+            }
 
 
 # ---------------------------------------------------------------------------
@@ -479,12 +487,22 @@ def classify_intent(text: str, context: Optional[ConversationContext] = None) ->
         "what's on the screen",
         "what am i seeing",
         "describe my screen",
+        "describe the screen",
+        "describe current screen",
         "read my screen",
         "what window is this",
         "what app is this",
         "look at my screen",
         "what is open on my screen",
         "what is currently on my screen",
+        "analyze my current screen",
+        "analyze the screen",
+        "analyze screen",
+        "analyze current screen",
+        "what am i watching",
+        "what's playing",
+        "what is playing",
+        "what video is this",
     ]
     if any(kw in t for kw in screen_keywords):
         return UserIntent.SCREEN_UNDERSTANDING

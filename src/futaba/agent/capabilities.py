@@ -56,8 +56,8 @@ class ToolCapabilityRegistry:
                 supports_visual_interaction=True,
                 supports_native_ui=True,
                 supported_actions=[
-                    "inspect", "screenshot", "click", "type", "key", "press",
-                    "move", "drag", "hotkey"
+                    "inspect", "screenshot", "capture", "analyze", "describe",
+                    "click", "type", "key", "press", "move", "drag", "hotkey"
                 ],
             )
         )
