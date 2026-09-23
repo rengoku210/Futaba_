@@ -1,0 +1,34 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller / Build artifacts
+build/
+dist/
+*.spec.bak
+
+# Node dependencies
+node_modules/
+
+# Test & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Scratch & temporary files
+scratch/
+*.tmp
+*.log
+
+# Sensitive credentials & environment files
+.env
+.env.*
+!*.example
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
