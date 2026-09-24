@@ -165,6 +165,8 @@ class ModelRoutingConfig(BaseModel):
     fallback_model: str = "gemini-3.6-flash"
     fast_provider: str = "openrouter"
     fast_model: str = "google/gemini-2.5-flash"
+    intent_provider: str = "openrouter"
+    intent_model: str = "google/gemini-2.5-flash"
     # If empty strings, uses the default provider/model
     auto_route: bool = True
     cost_aware: bool = True

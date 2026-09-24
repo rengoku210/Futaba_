@@ -195,6 +195,11 @@ class ToolCapabilityRegistry:
             return True
 
         err_lower = error.lower()
+
+        # Auth errors are never transient
+        if self.is_auth_error(error):
+            return False
+
         non_transient_indicators = [
             "unknown tool",
             "unknown function",
@@ -217,6 +222,21 @@ class ToolCapabilityRegistry:
                 return False
 
         return True
+
+    def is_auth_error(self, error: str) -> bool:
+        """
+        Determine if an error is an authentication/authorization failure.
+        These are permanent until credentials change — never retry.
+        """
+        if not error:
+            return False
+        err_lower = error.lower()
+        auth_indicators = [
+            "401", "403", "unauthorized", "forbidden",
+            "authentication", "invalid api key", "invalid_api_key",
+            "incorrect api key", "api key not valid",
+        ]
+        return any(indicator in err_lower for indicator in auth_indicators)
 
     def get_planner_prompt_section(self) -> str:
         """

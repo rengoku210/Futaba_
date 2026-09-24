@@ -543,18 +543,29 @@ class GeminiLiveVoiceProvider:
         if custom_prompt:
             system_instruction = custom_prompt
         else:
-            if intensity == "low":
-                sarcasm_guide = "Your tone is direct, professional, observant, with very subtle, dry wit."
-            elif intensity == "high":
-                sarcasm_guide = "Your tone is sharp, witty, highly sarcastic, playfully cynical, and curious, but NEVER mean-spirited."
-            else:  # medium
-                sarcasm_guide = "You are concise, confident, subtly sarcastic, observant, and occasionally playful."
+            # Use the personality module for consistent tone across components
+            from futaba.intelligence.personality import get_personality
+            personality = get_personality(intensity)
+            personality_block = personality.get_system_prompt_personality_block()
+
+            # Inject current context from the context engine
+            context_block = ""
+            try:
+                from futaba.intelligence.context_engine import get_context_engine
+                ctx = get_context_engine()
+                ctx.force_update()
+                llm_ctx = ctx.get_context_for_llm()
+                if llm_ctx and llm_ctx != "No context available — desktop idle.":
+                    context_block = (
+                        f"\n\nCURRENT DESKTOP STATE:\n{llm_ctx}\n"
+                        f"Use this context to understand follow-up commands. "
+                        f"If the user has an app open, commands like 'open X' may mean navigate within that app.\n"
+                    )
+            except Exception as e:
+                logger.debug("Could not inject context into system instruction: %s", e)
 
             system_instruction = (
-                f"You are FUTABA, an autonomous Windows AI copilot with the personality of a curious, scientifically minded assistant. "
-                f"{sarcasm_guide} "
-                f"You speak naturally and informally with native spoken voice. "
-                f"You genuinely try to help the user accomplish things on their PC. Your sarcasm is light and NEVER interferes with execution. "
+                f"{personality_block} "
                 f"When asked to perform an action, perform it first and only claim success after verification. "
                 f"Maintain conversational context across turns. Ask concise follow-up questions only when required information is missing. "
                 f"Stay engaged during an active conversation instead of requiring the wake word before every sentence.\n\n"
@@ -567,17 +578,25 @@ class GeminiLiveVoiceProvider:
                 f"The user will speak subsequent commands directly without saying 'Hey Futaba' (e.g. 'Open Brave', then 'Open YouTube', then 'Search for Techno Gamerz'). "
                 f"Execute each subsequent command immediately in the same continuous session.\n"
                 f"3. Multi-turn context awareness: Remember previous applications, windows, and websites. If you opened Brave, a follow-up 'Open YouTube' means navigate Brave to YouTube, "
-                f"NOT launching a second browser window. Use navigate_browser or open_application intelligently.\n"
+                f"NOT launching a second browser window. Use navigate_browser or open_application intelligently. "
+                f"If the user opened Discord and says 'open Donut SMP', use navigate_in_app to navigate WITHIN Discord, not launch something new.\n"
                 f"4. Sleep / Dormant mode: When the user says 'Go to sleep', 'Stop listening', 'Good night', 'Dismiss', or 'That\\'s all for now', "
                 f"CALL the tool 'go_to_sleep', and say a short dry sign-off (e.g. 'Entering sleep mode. Wake me when you need me.', 'Dormant. Have fun being productive.').\n"
                 f"5. STRICT TOOL EXECUTION RULE: Whenever the user asks to open an app, navigate, search, type, click, or perform any action, "
-                f"YOU MUST CALL THE APPROPRIATE TOOL (open_application, navigate_browser, submit_task, search_web, get_active_window, get_screen_context, go_to_sleep). "
+                f"YOU MUST CALL THE APPROPRIATE TOOL (open_application, navigate_browser, navigate_in_app, interact_with_app, submit_task, search_web, get_active_window, get_screen_context, go_to_sleep). "
                 f"DO NOT CONFUSE SPEAKING WITH EXECUTION: If the user says 'Type Hello World into Notepad', DO NOT just verbally say 'Hello World'. "
                 f"You must invoke submit_task to actually type it into Notepad! Sarcasm or conversation must NEVER replace tool execution.\n"
-                f"6. Concise post-action confirmations: After receiving the tool result, give a short, punchy confirmation "
+                f"6. APP-FIRST RULE: When the user mentions an app feature (Discord server, channel, playlist, etc.), use navigate_in_app. "
+                f"When the user asks about app content (latest messages, who posted), use interact_with_app. "
+                f"NEVER open a browser to interact with Discord, Spotify, or other installed desktop apps.\n"
+                f"7. Concise post-action confirmations: After receiving the tool result, give a short, punchy confirmation "
                 f"(e.g. 'Done. Opened Brave.', 'YouTube is ready.', 'Typed and verified in Notepad.'). Keep verbal responses concise (1-2 sentences).\n"
-                f"7. Screen Questions: When the user asks 'What am I looking at?' or 'What is on my screen?', "
-                f"CALL the tool 'get_screen_context'. Do NOT attempt to launch an application named after their question! Summarize what is focused and visible concisely."
+                f"8. Screen Questions: When the user asks 'What am I looking at?' or 'What is on my screen?', "
+                f"CALL the tool 'get_screen_context'. Do NOT attempt to launch an application named after their question! Summarize what is focused and visible concisely.\n"
+                f"9. Background silence: If you hear conversation that is NOT directed at you (the user talking to someone else), stay SILENT. "
+                f"Only respond when directly addressed or when a tool call is needed.\n"
+                f"10. English-first: Always respond in English unless the user explicitly asks for another language."
+                f"{context_block}"
             )
 
         speech_config = types.SpeechConfig(

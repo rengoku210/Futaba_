@@ -355,6 +355,41 @@ class SystemContextTracker:
             except Exception as start_err:
                 return {"status": "error", "message": f"Could not launch {target}: {start_err}"}
 
+    def get_installed_applications(self) -> dict[str, str]:
+        """
+        Scan and return a mapping of application names to executable paths or launch targets.
+        Scans common locations (Start Menu shortcuts, AppData, Program Files) with caching.
+        """
+        now = time.monotonic()
+        if hasattr(self, "_installed_apps_cache") and self._installed_apps_cache:
+            if now - getattr(self, "_installed_apps_cache_time", 0) < 300.0:
+                return self._installed_apps_cache
+
+        apps: dict[str, str] = {}
+        try:
+            from futaba.intelligence.context_engine import APPLICATION_ALIASES
+            for name, exe in APPLICATION_ALIASES.items():
+                apps[name] = f"{exe}.exe"
+        except Exception:
+            pass
+
+        start_menu_dirs = [
+            os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs"),
+            os.path.expandvars(r"%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs"),
+        ]
+        for base_dir in start_menu_dirs:
+            if not os.path.exists(base_dir):
+                continue
+            for root, _, files in os.walk(base_dir):
+                for f in files:
+                    if f.lower().endswith(".lnk"):
+                        name = f[:-4].lower()
+                        if name not in apps:
+                            apps[name] = os.path.join(root, f)
+
+        self._installed_apps_cache = apps
+        self._installed_apps_cache_time = now
+        return apps
 
     def get_screen_context(self, query: str = "") -> dict[str, Any]:
         """
@@ -472,13 +507,66 @@ class ConversationContext:
 def classify_intent(text: str, context: Optional[ConversationContext] = None) -> UserIntent:
     """
     Classify user text into a structured semantic intent.
-    Prevents confusing conversational phrases with application launches.
+    Uses the cognitive IntentResolver while maintaining full backward compatibility.
     """
     t = text.lower().strip()
     if not t:
         return UserIntent.GENERAL_CONVERSATION
 
-    # 1. Screen understanding / visual inspection queries
+    try:
+        from futaba.intelligence.intent_resolver import get_intent_resolver, IntentCategory
+        resolver = get_intent_resolver()
+        active_app = ""
+        active_process = ""
+        target_application = ""
+        browser_service = ""
+        last_action = ""
+
+        try:
+            from futaba.intelligence.context_engine import get_context_engine
+            ce = get_context_engine()
+            target_application = ce.get_target_app()
+            if ce.state.active_app:
+                active_app = ce.state.active_app.name
+                active_process = ce.state.active_app.process_name
+            browser_service = ce.state.browser_state.service
+            last_action = ce.state.last_action
+        except Exception:
+            pass
+
+        resolved = resolver.resolve(
+            text,
+            active_app=active_app,
+            active_process=active_process,
+            target_application=target_application,
+            browser_service=browser_service,
+            last_action=last_action,
+        )
+
+        mapping = {
+            IntentCategory.SCREEN_QUERY: UserIntent.SCREEN_UNDERSTANDING,
+            IntentCategory.APPLICATION_LAUNCH: UserIntent.APPLICATION_CONTROL,
+            IntentCategory.APPLICATION_FOCUS: UserIntent.APPLICATION_CONTROL,
+            IntentCategory.APPLICATION_NAVIGATION: UserIntent.APPLICATION_CONTROL,
+            IntentCategory.APPLICATION_INTERACTION: UserIntent.TASK_EXECUTION,
+            IntentCategory.BROWSER_NAVIGATION: UserIntent.BROWSER_NAVIGATION,
+            IntentCategory.BROWSER_INTERACTION: UserIntent.BROWSER_INTERACTION,
+            IntentCategory.FILE_OPERATION: UserIntent.TASK_EXECUTION,
+            IntentCategory.SYSTEM_OPERATION: UserIntent.TASK_EXECUTION,
+            IntentCategory.TASK_EXECUTION: UserIntent.TASK_EXECUTION,
+            IntentCategory.FOLLOW_UP: UserIntent.FOLLOW_UP,
+            IntentCategory.INFORMATION_QUERY: UserIntent.INFORMATION_QUERY,
+            IntentCategory.CONVERSATION: UserIntent.GENERAL_CONVERSATION,
+            IntentCategory.TASK_CONTROL: UserIntent.GENERAL_CONVERSATION,
+            IntentCategory.SLEEP_COMMAND: UserIntent.GENERAL_CONVERSATION,
+            IntentCategory.CLARIFICATION_REQUIRED: UserIntent.GENERAL_CONVERSATION,
+        }
+        if resolved.category in mapping:
+            return mapping[resolved.category]
+    except Exception as e:
+        logger.debug("IntentResolver fallback in classify_intent: %s", e)
+
+    # Fallback to direct heuristic classification
     screen_keywords = [
         "what am i looking at",
         "what's on my screen",
@@ -507,19 +595,15 @@ def classify_intent(text: str, context: Optional[ConversationContext] = None) ->
     if any(kw in t for kw in screen_keywords):
         return UserIntent.SCREEN_UNDERSTANDING
 
-    # 2. Dormant / sleep commands
     if any(kw in t for kw in ["go to sleep", "stop listening", "good night", "dismiss", "that's all for now", "sleep mode"]):
         return UserIntent.GENERAL_CONVERSATION
 
-    # 3. Wake phrases alone
     if t in ("hey futaba", "hay futaba", "futaba", "hello futaba", "hi futaba"):
         return UserIntent.GENERAL_CONVERSATION
 
-    # 4. Web search queries
     if t.startswith("search ") or "search for " in t or "google " in t or "search youtube for" in t:
         return UserIntent.BROWSER_NAVIGATION
 
-    # 5. Explicit browser navigation (URLs or known web services)
     for nav_prefix in ("go to ", "navigate to ", "visit "):
         if t.startswith(nav_prefix):
             return UserIntent.BROWSER_NAVIGATION
@@ -528,13 +612,11 @@ def classify_intent(text: str, context: Optional[ConversationContext] = None) ->
     for prefix in ("open ", "launch ", "start "):
         if t.startswith(prefix):
             target = t[len(prefix):].strip()
-            # If target looks like a question or conversational phrase, do not treat as app launch
             if any(target.startswith(w) for w in ["what", "how", "why", "who", "where", "a ", "the "]):
                 return UserIntent.INFORMATION_QUERY
             is_web, _ = tracker.is_web_destination(target)
             if is_web:
                 return UserIntent.BROWSER_NAVIGATION
-            # Multi-step action disguised as launch
             if any(action in target for action in ("and type", "and search", "and write")):
                 return UserIntent.TASK_EXECUTION
             return UserIntent.APPLICATION_CONTROL
@@ -542,19 +624,15 @@ def classify_intent(text: str, context: Optional[ConversationContext] = None) ->
     if any(t.startswith(prefix) for prefix in ("close ", "kill ", "quit ", "terminate ")):
         return UserIntent.APPLICATION_CONTROL
 
-    # 6. Task execution (typing, clicking, file creation, multi-step actions)
     if any(kw in t for kw in ["type ", "write into", "type into", "click on", "press ", "save as", "create a ", "delete the ", "organize "]):
         return UserIntent.TASK_EXECUTION
 
-    # 7. Follow-up commands
     if any(t.startswith(kw) for kw in ["now ", "and then ", "then ", "also ", "next ", "do it again", "close that", "save it"]):
         return UserIntent.FOLLOW_UP
 
-    # 8. Information queries
     if any(t.startswith(kw) for kw in ["who is", "what is the", "why is", "tell me a", "how many", "explain ", "what time"]):
         return UserIntent.INFORMATION_QUERY
 
-    # Default
     return UserIntent.GENERAL_CONVERSATION
 
 

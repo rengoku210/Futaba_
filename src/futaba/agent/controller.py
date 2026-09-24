@@ -423,13 +423,29 @@ class AgentController:
     async def _generate_plan(self, task: Task) -> ExecutionPlan:
         """
         Use the planner model to generate an execution plan.
+        Injects current context (active app, browser, conversation) for awareness.
         """
+        # Gather current desktop context for the planner
+        context_block = ""
+        try:
+            from futaba.intelligence.context_engine import get_context_engine
+            ctx = get_context_engine()
+            ctx.update()  # Refresh to latest state
+            ctx.set_active_task(task.user_request)
+            context_block = ctx.get_context_for_llm()
+        except Exception as e:
+            logger.debug("Could not inject context into planner: %s", e)
+
+        user_content = f"Create an execution plan for this objective:\n\n{task.user_request}"
+        if context_block:
+            user_content = (
+                f"CURRENT DESKTOP CONTEXT:\n{context_block}\n\n"
+                f"---\n\n{user_content}"
+            )
+
         messages = [
             ChatMessage(role="system", content=PLANNER_SYSTEM_PROMPT),
-            ChatMessage(
-                role="user",
-                content=f"Create an execution plan for this objective:\n\n{task.user_request}"
-            ),
+            ChatMessage(role="user", content=user_content),
         ]
 
         request = ModelRequest(
@@ -481,11 +497,13 @@ class AgentController:
     # -----------------------------------------------------------------------
 
     async def _execute_plan(self, task: Task) -> None:
-        """Execute all pending steps in a task's plan."""
+        """Execute all pending steps in a task's plan with stall detection."""
         if not task.plan:
             return
 
         config = get_config()
+        STEP_WARN_TIMEOUT = 60.0   # Warn after 60s
+        STEP_FAIL_TIMEOUT = 120.0  # Force-fail after 120s
 
         while True:
             # Check cancellation
@@ -508,8 +526,39 @@ class AgentController:
                     await self._task_manager.set_blocker(task.task_id, blocker)
                     return  # Will be resumed when user responds
 
-            # Execute the step
-            await self._execute_step(task, step)
+            # Execute the step with stall detection
+            step_start = time.monotonic()
+            execute_task = asyncio.create_task(self._execute_step(task, step))
+            warned = False
+
+            while not execute_task.done():
+                elapsed = time.monotonic() - step_start
+                if elapsed > STEP_FAIL_TIMEOUT:
+                    logger.error(
+                        "Task %s step %d STALLED after %.0fs — force-failing",
+                        task.task_id[:8], step.index, elapsed,
+                    )
+                    execute_task.cancel()
+                    try:
+                        await execute_task
+                    except asyncio.CancelledError:
+                        pass
+                    step.state = StepState.FAILED
+                    step.error = f"Step timed out after {STEP_FAIL_TIMEOUT:.0f}s"
+                    break
+                if elapsed > STEP_WARN_TIMEOUT and not warned:
+                    logger.warning(
+                        "Task %s step %d running for %.0fs — possible stall",
+                        task.task_id[:8], step.index, elapsed,
+                    )
+                    warned = True
+                await asyncio.sleep(1.0)
+
+            if execute_task.done() and not execute_task.cancelled():
+                # Re-raise any exception from the step
+                exc = execute_task.exception()
+                if exc:
+                    raise exc
 
             # Checkpoint after each successful step
             if step.state == StepState.COMPLETED:
@@ -520,6 +569,13 @@ class AgentController:
                 can_continue = await self._handle_step_failure(task, step)
                 if not can_continue:
                     return
+
+        # Clear active task in context engine
+        try:
+            from futaba.intelligence.context_engine import get_context_engine
+            get_context_engine().set_active_task(None)
+        except Exception:
+            pass
 
         await self._emit_status(task.task_id, "All steps completed")
 

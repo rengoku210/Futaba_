@@ -132,6 +132,44 @@ class StreamChunk:
 
 
 # ---------------------------------------------------------------------------
+# Provider Health States
+# ---------------------------------------------------------------------------
+
+class ProviderHealthState(str, enum.Enum):
+    """Provider health classification. AUTH_FAILED is never retried."""
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"           # Slow but working
+    AUTH_FAILED = "auth_failed"     # 401/403 — permanent, never retry
+    RATE_LIMITED = "rate_limited"   # 429 — backoff then retry
+    OFFLINE = "offline"             # Connection failed after retries
+
+
+def _classify_error(error: str) -> ProviderHealthState:
+    """Classify an error string into a health state."""
+    lower = error.lower()
+
+    # Auth failures — permanent until credentials change
+    if any(code in lower for code in ("401", "403", "unauthorized", "forbidden",
+                                       "authentication", "invalid api key",
+                                       "invalid_api_key", "incorrect api key")):
+        return ProviderHealthState.AUTH_FAILED
+
+    # Rate limiting — temporary
+    if any(code in lower for code in ("429", "rate limit", "rate_limit",
+                                       "too many requests", "quota exceeded",
+                                       "resource_exhausted")):
+        return ProviderHealthState.RATE_LIMITED
+
+    # Connection errors — may recover
+    if any(kw in lower for kw in ("connection", "timeout", "unreachable",
+                                    "dns", "socket", "eof", "reset")):
+        return ProviderHealthState.OFFLINE
+
+    # Default: degraded (unknown error, might recover)
+    return ProviderHealthState.DEGRADED
+
+
+# ---------------------------------------------------------------------------
 # Provider Client Interface
 # ---------------------------------------------------------------------------
 
@@ -140,18 +178,37 @@ class ProviderClient(ABC):
 
     def __init__(self, config: ProviderConfig):
         self.config = config
-        self._healthy = True
+        self._health_state = ProviderHealthState.HEALTHY
         self._last_error: str = ""
         self._last_success: float = 0.0
         self._consecutive_failures: int = 0
+        self._rate_limit_until: float = 0.0    # monotonic time until rate limit expires
 
     @property
     def name(self) -> str:
         return self.config.name
 
     @property
+    def health_state(self) -> ProviderHealthState:
+        """Current provider health state."""
+        # Auto-recover from rate limiting after backoff
+        if (self._health_state == ProviderHealthState.RATE_LIMITED
+                and time.time() > self._rate_limit_until):
+            self._health_state = ProviderHealthState.HEALTHY
+            self._consecutive_failures = 0
+            logger.info("Provider %s rate-limit backoff expired, restoring to HEALTHY", self.name)
+        return self._health_state
+
+    @property
     def is_healthy(self) -> bool:
-        return self._healthy
+        """True if the provider can accept requests."""
+        state = self.health_state
+        return state in (ProviderHealthState.HEALTHY, ProviderHealthState.DEGRADED)
+
+    @property
+    def is_permanently_failed(self) -> bool:
+        """True if the provider has a permanent failure (auth)."""
+        return self.health_state == ProviderHealthState.AUTH_FAILED
 
     @abstractmethod
     async def complete(
@@ -187,19 +244,50 @@ class ProviderClient(ABC):
         ...
 
     def record_success(self) -> None:
-        self._healthy = True
+        self._health_state = ProviderHealthState.HEALTHY
         self._last_success = time.time()
         self._consecutive_failures = 0
 
     def record_failure(self, error: str) -> None:
         self._consecutive_failures += 1
         self._last_error = error
-        if self._consecutive_failures >= 3:
-            self._healthy = False
-            logger.warning(
-                "Provider %s marked unhealthy after %d consecutive failures: %s",
-                self.name, self._consecutive_failures, error
+
+        classified = _classify_error(error)
+
+        if classified == ProviderHealthState.AUTH_FAILED:
+            self._health_state = ProviderHealthState.AUTH_FAILED
+            logger.error(
+                "Provider %s AUTH_FAILED: %s — will NOT retry until credentials change",
+                self.name, error[:100]
             )
+        elif classified == ProviderHealthState.RATE_LIMITED:
+            self._health_state = ProviderHealthState.RATE_LIMITED
+            # Exponential backoff: 30s, 60s, 120s, max 300s
+            backoff = min(30 * (2 ** (self._consecutive_failures - 1)), 300)
+            self._rate_limit_until = time.time() + backoff
+            logger.warning(
+                "Provider %s RATE_LIMITED: backoff %ds. Error: %s",
+                self.name, backoff, error[:100]
+            )
+        elif classified == ProviderHealthState.OFFLINE:
+            if self._consecutive_failures >= 3:
+                self._health_state = ProviderHealthState.OFFLINE
+                logger.warning(
+                    "Provider %s OFFLINE after %d consecutive failures: %s",
+                    self.name, self._consecutive_failures, error[:100]
+                )
+            else:
+                self._health_state = ProviderHealthState.DEGRADED
+        else:
+            # DEGRADED
+            if self._consecutive_failures >= 3:
+                self._health_state = ProviderHealthState.OFFLINE
+                logger.warning(
+                    "Provider %s OFFLINE after %d failures: %s",
+                    self.name, self._consecutive_failures, error[:100]
+                )
+            else:
+                self._health_state = ProviderHealthState.DEGRADED
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +593,7 @@ class ModelRouter:
         provider_name, model = self._route_explicit(request)
         if provider_name and model:
             client = self._registry.get(provider_name)
-            if client and client.is_healthy:
+            if client and client.is_healthy and not client.is_permanently_failed:
                 logger.debug(
                     "Routed %s/%s to %s/%s (explicit)",
                     request.role, request.complexity.value,
@@ -515,7 +603,7 @@ class ModelRouter:
 
         # 2. Try default provider
         default = self._registry.get(self._default_provider)
-        if default and default.is_healthy:
+        if default and default.is_healthy and not default.is_permanently_failed:
             model = self._select_model_for_complexity(request, default)
             return default, model
 
@@ -583,7 +671,7 @@ class ModelRouter:
         for fallback in self._registry.all():
             if fallback is client:
                 continue  # Skip the failed primary
-            if not fallback.is_healthy:
+            if not fallback.is_healthy or fallback.is_permanently_failed:
                 continue
             try:
                 fb_model = fallback.config.default_model
@@ -688,7 +776,10 @@ class ModelRouter:
             "providers": {
                 c.name: {
                     "healthy": c.is_healthy,
+                    "health_state": c.health_state.value,
+                    "permanently_failed": c.is_permanently_failed,
                     "last_error": c._last_error,
+                    "consecutive_failures": c._consecutive_failures,
                 }
                 for c in self._registry.all()
             },

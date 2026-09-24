@@ -8,6 +8,13 @@ FUTABA orchestrates state, tasks, tools, and UI.
 
 Gemini never directly executes raw shell commands or raw Windows APIs.
 It invokes controlled high-level functions registered here.
+
+Intelligence Integration:
+The router now uses ContextEngine, IntentResolver, and ExecutionSurfaceSelector
+to make context-aware routing decisions. This enables:
+- In-app navigation (e.g., "open Donut SMP" within Discord)
+- Application ownership persistence across follow-ups
+- Direct action bypass (simple ops skip the full planner pipeline)
 """
 
 from __future__ import annotations
@@ -23,6 +30,9 @@ if TYPE_CHECKING:
     from futaba.agent.hermes_bridge import HermesBridge
 
 from futaba.system.context_tracker import get_context_tracker
+from futaba.intelligence.context_engine import get_context_engine
+from futaba.intelligence.intent_resolver import get_intent_resolver, IntentCategory
+from futaba.intelligence.execution_surface import get_surface_selector, ExecutionSurface
 
 logger = logging.getLogger("futaba.voice.router")
 
@@ -30,6 +40,7 @@ logger = logging.getLogger("futaba.voice.router")
 class VoiceCommandRouter:
     """
     Executes controlled functions requested by Gemini Live.
+    Uses the intelligence layer for context-aware routing.
     """
 
     def __init__(
@@ -45,6 +56,11 @@ class VoiceCommandRouter:
         self.tools = tools
         self.hermes_bridge = hermes_bridge
         self.on_sleep_requested = on_sleep_requested
+
+        # Intelligence layer (singletons)
+        self._context = get_context_engine()
+        self._intent_resolver = get_intent_resolver()
+        self._surface_selector = get_surface_selector()
 
     def inject(
         self,
@@ -236,6 +252,53 @@ class VoiceCommandRouter:
                             },
                         },
                     },
+                    {
+                        "name": "navigate_in_app",
+                        "description": (
+                            "Navigate within the currently active application. Use this when the user "
+                            "wants to go to a specific section, server, channel, playlist, tab, or page "
+                            "WITHIN an already-open app. Examples: 'open Donut SMP' (Discord server), "
+                            "'go to general' (Discord channel), 'open my playlist' (Spotify). "
+                            "Do NOT use this to launch a new application — use open_application for that."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "target": {
+                                    "type": "STRING",
+                                    "description": "The name of the item to navigate to within the current app (e.g. 'Donut SMP', 'general', 'My Playlist').",
+                                },
+                                "app": {
+                                    "type": "STRING",
+                                    "description": "Optional. The application to navigate within (e.g. 'Discord', 'Spotify'). If omitted, uses the currently active/target app.",
+                                },
+                            },
+                            "required": ["target"],
+                        },
+                    },
+                    {
+                        "name": "interact_with_app",
+                        "description": (
+                            "Read content or interact with the currently active application. Use this "
+                            "when the user asks about what's happening in the current app, such as "
+                            "'what are the latest messages', 'read the chat', 'what notifications do I have', "
+                            "'who posted last'. This inspects the app's visible content."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "query": {
+                                    "type": "STRING",
+                                    "description": "What the user wants to know about the app content (e.g. 'latest messages', 'who is online', 'current track').",
+                                },
+                                "app": {
+                                    "type": "STRING",
+                                    "description": "Optional. The application to query. If omitted, uses the currently active/target app.",
+                                },
+                            },
+                            "required": ["query"],
+                        },
+                    },
                 ]
             }
         ]
@@ -243,8 +306,12 @@ class VoiceCommandRouter:
     async def execute_tool_call(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """
         Execute a function called by Gemini Live and return structured result.
+        Updates the ContextEngine with each action result.
         """
         logger.info("Gemini Live requested tool call: %s with args %s", name, args)
+
+        # Refresh context state before handling
+        self._context.update()
 
         handler = getattr(self, f"_handle_{name}", None)
         if handler:
@@ -307,11 +374,33 @@ class VoiceCommandRouter:
         if lower_name in conversational_phrases:
             return {"status": "error", "message": f"'{app_name}' is not recognized as a Windows application."}
 
+        # Context-aware check: Is this actually an in-app navigation?
+        # If Discord is the target app and user says "open Donut SMP", route to navigate_in_app
+        target_app = self._context.get_target_app()
+        if target_app:
+            intent = self._intent_resolver.resolve(
+                f"open {app_name}",
+                target_application=target_app,
+                active_process=self._context.state.active_app.process_name if self._context.state.active_app else "",
+            )
+            if intent.category == IntentCategory.APPLICATION_NAVIGATION:
+                logger.info(
+                    "Rerouting 'open %s' to navigate_in_app (context: target=%s)",
+                    app_name, target_app,
+                )
+                return await self._handle_navigate_in_app({
+                    "target": app_name,
+                    "app": target_app,
+                })
+
         # First consult SystemContextTracker to prevent duplicate windows and reuse open browsers/apps
         try:
             tracker = get_context_tracker()
             res = tracker.open_or_navigate(app_name, new_tab=False, new_window=False)
             if res.get("status") == "success":
+                # Record in context engine
+                self._context.record_action(f"opened {app_name}", target_app=app_name)
+                self._context.mark_app_owned(app_name.lower().replace(" ", "") + ".exe")
                 return {
                     "status": "success",
                     "message": res.get("message", f"Opened {app_name}."),
@@ -326,6 +415,9 @@ class VoiceCommandRouter:
             if app_tool:
                 res = await app_tool.execute(action="launch", parameters={"name": app_name})
                 if res.success:
+                    # Record in context engine
+                    self._context.record_action(f"opened {app_name}", target_app=app_name)
+                    self._context.mark_app_owned(app_name.lower().replace(" ", "") + ".exe")
                     return {
                         "status": "success",
                         "message": f"I have opened {app_name} on your computer.",
@@ -336,6 +428,7 @@ class VoiceCommandRouter:
         try:
             import os
             os.startfile(app_name if app_name.endswith((".exe", ".msc")) else f"{app_name}.exe")
+            self._context.record_action(f"opened {app_name}", target_app=app_name)
             return {"status": "success", "message": f"I opened {app_name} on your computer."}
         except Exception as e:
             return {"status": "error", "message": f"Could not launch {app_name}: {e}"}
@@ -350,12 +443,159 @@ class VoiceCommandRouter:
         tracker = get_context_tracker()
         res = tracker.open_or_navigate(url, new_tab=new_tab)
         if res.get("status") == "success":
+            self._context.record_action(f"navigated to {url}")
             return {
                 "status": "success",
                 "message": res.get("message", f"Navigated to {url}."),
                 "details": res,
             }
         return {"status": "error", "message": res.get("message", f"Could not navigate to {url}.")}
+
+    async def _handle_navigate_in_app(self, args: dict[str, Any]) -> dict[str, Any]:
+        """
+        Navigate within the currently active application.
+
+        Uses UIA (pywinauto) for in-app navigation, falling back to CUA (Hermes)
+        if UIA cannot locate the target element.
+
+        Examples:
+        - Discord: navigate to server "Donut SMP", channel "#general"
+        - Spotify: navigate to playlist "My Playlist"
+        """
+        target = args.get("target", "").strip()
+        app = args.get("app", "").strip() or self._context.get_target_app()
+
+        if not target:
+            return {"status": "error", "message": "No navigation target specified."}
+
+        logger.info("In-app navigation: target=%s, app=%s", target, app)
+
+        # Strategy 1: Submit as a context-aware task to Hermes
+        # Build a specific instruction that references the current app context
+        if app:
+            instruction = f"In the {app} application, navigate to '{target}'. Do NOT open a browser. Do NOT launch a new application. Stay within {app}."
+        else:
+            instruction = f"Navigate to '{target}' within the current application."
+
+        # Submit as task
+        if self.task_manager:
+            try:
+                task = self.task_manager.create_task(
+                    instruction,
+                    origin="voice_navigate_in_app",
+                    priority=3,  # Higher priority for direct user requests
+                )
+                self._context.record_action(
+                    f"navigating to {target} in {app}",
+                    target_app=app,
+                )
+
+                # Wait briefly for completion (fast in-app nav should complete quickly)
+                deadline = asyncio.get_event_loop().time() + 10.0
+                while asyncio.get_event_loop().time() < deadline:
+                    await asyncio.sleep(0.5)
+                    from futaba.tasks.task_manager import TaskState
+                    current = self.task_manager.get_task(task.id)
+                    if not current:
+                        break
+                    if current.state == TaskState.COMPLETED:
+                        return {
+                            "status": "success",
+                            "message": f"Navigated to {target} in {app}.",
+                            "target": target,
+                            "app": app,
+                        }
+                    if current.state in (TaskState.FAILED, TaskState.CANCELLED):
+                        return {
+                            "status": "error",
+                            "message": f"Could not navigate to {target} in {app}: task {current.state.value}",
+                        }
+
+                return {
+                    "status": "running",
+                    "message": f"Navigating to {target} in {app}. This may take a moment.",
+                    "task_id": task.id,
+                }
+            except Exception as e:
+                logger.error("navigate_in_app task submission failed: %s", e)
+                return {"status": "error", "message": f"Navigation failed: {e}"}
+
+        return {"status": "error", "message": "Task manager not available for in-app navigation."}
+
+    async def _handle_interact_with_app(self, args: dict[str, Any]) -> dict[str, Any]:
+        """
+        Read content or interact with the currently active application.
+
+        Uses screen context analysis to read visible content from the app.
+        Falls back to CUA for complex interactions.
+        """
+        query = args.get("query", "").strip()
+        app = args.get("app", "").strip() or self._context.get_target_app()
+
+        if not query:
+            return {"status": "error", "message": "No query specified."}
+
+        logger.info("App interaction: query=%s, app=%s", query, app)
+
+        # Strategy 1: Use screen context provider to read current visible content
+        try:
+            from futaba.system.screen_provider import get_screen_provider
+            provider = get_screen_provider()
+            context_query = f"{query} in {app}" if app else query
+            res = await provider.analyze(query=context_query)
+            if res and res.summary:
+                self._context.record_action(f"inspected {app}: {query}")
+                return {
+                    "status": "success",
+                    "app": app,
+                    "query": query,
+                    "content": res.summary,
+                    "window_title": res.window_title,
+                }
+        except Exception as e:
+            logger.warning("Screen analysis for app interaction failed: %s", e)
+
+        # Strategy 2: Submit as a task for CUA to read the screen
+        if self.task_manager:
+            try:
+                instruction = (
+                    f"Look at the {app} application and answer: {query}. "
+                    f"Read the visible content on screen. Do NOT open a browser."
+                )
+                task = self.task_manager.create_task(
+                    instruction,
+                    origin="voice_interact_with_app",
+                    priority=3,
+                )
+                self._context.record_action(f"reading {app}: {query}")
+
+                # Wait for completion
+                deadline = asyncio.get_event_loop().time() + 8.0
+                while asyncio.get_event_loop().time() < deadline:
+                    await asyncio.sleep(0.5)
+                    from futaba.tasks.task_manager import TaskState
+                    current = self.task_manager.get_task(task.id)
+                    if not current:
+                        break
+                    if current.state == TaskState.COMPLETED:
+                        return {
+                            "status": "success",
+                            "app": app,
+                            "query": query,
+                            "content": current.verification_evidence or "Content read successfully.",
+                        }
+                    if current.state in (TaskState.FAILED, TaskState.CANCELLED):
+                        break
+
+                return {
+                    "status": "running",
+                    "message": f"Reading {app} content. One moment.",
+                    "task_id": task.id,
+                }
+            except Exception as e:
+                logger.error("interact_with_app task failed: %s", e)
+
+        return {"status": "error", "message": f"Could not read content from {app}."}
 
     async def _handle_go_to_sleep(self, args: dict[str, Any]) -> dict[str, Any]:
         """Put Futaba to sleep / dormant mode."""
