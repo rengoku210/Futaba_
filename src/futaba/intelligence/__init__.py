@@ -36,6 +36,27 @@ from futaba.intelligence.personality import (
     FutabaPersonality,
     get_personality,
 )
+from futaba.intelligence.telemetry import (
+    LatencyRecord,
+    LatencyTelemetry,
+    get_latency_telemetry,
+)
+from futaba.intelligence.semantic_ui import (
+    SemanticUIElement,
+    SemanticUITargeter,
+    get_semantic_targeter,
+)
+from futaba.intelligence.micro_action import (
+    MicroActionResult,
+    MicroActionEngine,
+    get_micro_action_engine,
+)
+from futaba.intelligence.tier_router import (
+    ExecutionTier,
+    TierRouteDecision,
+    TierRouter,
+    get_tier_router,
+)
 
 __all__ = [
     "ContextEngine",
@@ -55,4 +76,17 @@ __all__ = [
     "get_surface_selector",
     "FutabaPersonality",
     "get_personality",
+    "LatencyRecord",
+    "LatencyTelemetry",
+    "get_latency_telemetry",
+    "SemanticUIElement",
+    "SemanticUITargeter",
+    "get_semantic_targeter",
+    "MicroActionResult",
+    "MicroActionEngine",
+    "get_micro_action_engine",
+    "ExecutionTier",
+    "TierRouteDecision",
+    "TierRouter",
+    "get_tier_router",
 ]

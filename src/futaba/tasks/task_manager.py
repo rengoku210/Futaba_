@@ -90,24 +90,26 @@ class TaskState(str, enum.Enum):
     """
     Task lifecycle states. Transitions are enforced by the state machine.
 
-    State diagram:
-        QUEUED → PLANNING → RUNNING → VERIFYING → COMPLETED
-                    ↓          ↓↑         ↓
-                  FAILED    RECOVERING  FAILED
-                              ↓
-                           BLOCKED → (user input) → RUNNING
-                              ↓
-                           FAILED
+    Master State Diagram (Section 31):
+        CREATED / QUEUED → UNDERSTANDING → CONTEXT_RESOLUTION → PLANNING → EXECUTING / RUNNING
+        → OBSERVING → VERIFYING → COMPLETED
 
-        Any state → CANCELLED (user-initiated)
+        Any active state → PAUSED / BLOCKED / RECOVERING / FAILED / CANCELLED
     """
-    QUEUED = "queued"
+    # Section 31 Explicit States
+    CREATED = "created"
+    QUEUED = "queued"                            # Backwards-compatible alias
+    UNDERSTANDING = "understanding"              # Parsing intent & constraints
+    CONTEXT_RESOLUTION = "context_resolution"    # Resolving app/entity context
     PLANNING = "planning"
-    RUNNING = "running"
-    WAITING = "waiting"          # Waiting for a sub-task or external event
-    BLOCKED = "blocked"          # Needs user input
-    RECOVERING = "recovering"    # Attempting error recovery
-    VERIFYING = "verifying"      # Verifying task completion
+    EXECUTING = "executing"
+    RUNNING = "running"                          # Backwards-compatible alias
+    OBSERVING = "observing"                      # Inspecting post-action state
+    WAITING = "waiting"                          # Waiting for external event
+    BLOCKED = "blocked"                          # Needs user input
+    RECOVERING = "recovering"                    # Attempting error recovery
+    VERIFYING = "verifying"                      # Verifying task completion
+    PAUSED = "paused"                            # User-paused or resource-paused
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -119,23 +121,33 @@ class TaskState(str, enum.Enum):
     @property
     def is_active(self) -> bool:
         return self in (
-            TaskState.QUEUED, TaskState.PLANNING, TaskState.RUNNING,
-            TaskState.WAITING, TaskState.RECOVERING, TaskState.VERIFYING
+            TaskState.CREATED, TaskState.QUEUED, TaskState.UNDERSTANDING,
+            TaskState.CONTEXT_RESOLUTION, TaskState.PLANNING,
+            TaskState.EXECUTING, TaskState.RUNNING, TaskState.OBSERVING,
+            TaskState.WAITING, TaskState.RECOVERING, TaskState.VERIFYING,
+            TaskState.PAUSED,
         )
 
 
-# Valid state transitions
+# Valid state transitions enforcing Section 31 prohibitions:
+# Especially prevent: FAILED → VERIFYING, CANCELLED → EXECUTING, COMPLETED → EXECUTING
 _VALID_TRANSITIONS: dict[TaskState, set[TaskState]] = {
-    TaskState.QUEUED:      {TaskState.PLANNING, TaskState.RUNNING, TaskState.BLOCKED, TaskState.CANCELLED, TaskState.FAILED},
-    TaskState.PLANNING:    {TaskState.RUNNING, TaskState.BLOCKED, TaskState.FAILED, TaskState.CANCELLED},
-    TaskState.RUNNING:     {TaskState.VERIFYING, TaskState.WAITING, TaskState.BLOCKED, TaskState.RECOVERING, TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED},
-    TaskState.WAITING:     {TaskState.RUNNING, TaskState.BLOCKED, TaskState.FAILED, TaskState.CANCELLED},
-    TaskState.BLOCKED:     {TaskState.RUNNING, TaskState.PLANNING, TaskState.QUEUED, TaskState.FAILED, TaskState.CANCELLED},
-    TaskState.RECOVERING:  {TaskState.RUNNING, TaskState.BLOCKED, TaskState.FAILED, TaskState.CANCELLED},
-    TaskState.VERIFYING:   {TaskState.COMPLETED, TaskState.RUNNING, TaskState.FAILED, TaskState.CANCELLED},
-    TaskState.COMPLETED:   set(),  # Terminal
-    TaskState.FAILED:      {TaskState.QUEUED, TaskState.RECOVERING},  # Can be retried from scratch or recovered
-    TaskState.CANCELLED:   set(),  # Terminal
+    TaskState.CREATED:            {TaskState.QUEUED, TaskState.UNDERSTANDING, TaskState.CONTEXT_RESOLUTION, TaskState.PLANNING, TaskState.EXECUTING, TaskState.RUNNING, TaskState.CANCELLED, TaskState.FAILED},
+    TaskState.QUEUED:             {TaskState.UNDERSTANDING, TaskState.CONTEXT_RESOLUTION, TaskState.PLANNING, TaskState.EXECUTING, TaskState.RUNNING, TaskState.BLOCKED, TaskState.CANCELLED, TaskState.FAILED},
+    TaskState.UNDERSTANDING:      {TaskState.CONTEXT_RESOLUTION, TaskState.PLANNING, TaskState.EXECUTING, TaskState.RUNNING, TaskState.BLOCKED, TaskState.FAILED, TaskState.CANCELLED},
+    TaskState.CONTEXT_RESOLUTION: {TaskState.PLANNING, TaskState.EXECUTING, TaskState.RUNNING, TaskState.BLOCKED, TaskState.FAILED, TaskState.CANCELLED},
+    TaskState.PLANNING:           {TaskState.EXECUTING, TaskState.RUNNING, TaskState.BLOCKED, TaskState.FAILED, TaskState.CANCELLED},
+    TaskState.EXECUTING:          {TaskState.OBSERVING, TaskState.VERIFYING, TaskState.WAITING, TaskState.BLOCKED, TaskState.RECOVERING, TaskState.PAUSED, TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED},
+    TaskState.RUNNING:            {TaskState.OBSERVING, TaskState.VERIFYING, TaskState.WAITING, TaskState.BLOCKED, TaskState.RECOVERING, TaskState.PAUSED, TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED},
+    TaskState.OBSERVING:          {TaskState.VERIFYING, TaskState.EXECUTING, TaskState.RUNNING, TaskState.RECOVERING, TaskState.FAILED, TaskState.CANCELLED},
+    TaskState.WAITING:            {TaskState.EXECUTING, TaskState.RUNNING, TaskState.BLOCKED, TaskState.FAILED, TaskState.CANCELLED},
+    TaskState.BLOCKED:            {TaskState.EXECUTING, TaskState.RUNNING, TaskState.PLANNING, TaskState.QUEUED, TaskState.FAILED, TaskState.CANCELLED},
+    TaskState.RECOVERING:         {TaskState.EXECUTING, TaskState.RUNNING, TaskState.PLANNING, TaskState.BLOCKED, TaskState.FAILED, TaskState.CANCELLED},
+    TaskState.VERIFYING:          {TaskState.COMPLETED, TaskState.EXECUTING, TaskState.RUNNING, TaskState.RECOVERING, TaskState.FAILED, TaskState.CANCELLED},
+    TaskState.PAUSED:             {TaskState.EXECUTING, TaskState.RUNNING, TaskState.CANCELLED, TaskState.FAILED},
+    TaskState.COMPLETED:          set(),  # Terminal: never transitions back to executing
+    TaskState.FAILED:             {TaskState.CREATED, TaskState.QUEUED, TaskState.RECOVERING},  # Can be restarted
+    TaskState.CANCELLED:          set(),  # Terminal: never transitions back to executing
 }
 
 

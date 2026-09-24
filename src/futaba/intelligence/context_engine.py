@@ -151,6 +151,50 @@ class ContextState:
     last_action_time: float = 0.0
     session_start: float = field(default_factory=time.monotonic)
 
+    # Extended Section 9 Persistent Context
+    active_server: str = ""
+    active_channel: str = ""
+    active_page: str = ""
+    active_search_query: str = ""
+    visible_controls: list[dict[str, Any]] = field(default_factory=list)
+    recent_user_intent: str = ""
+    previous_task: str | None = None
+    last_successful_action: str = ""
+    last_failed_action: str = ""
+    current_goal: str = ""
+    current_execution_surface: str = "DIRECT"
+    user_interaction_mode: str = "VOICE"
+    futaba_state: str = "IDLE"
+    recent_entities: list[str] = field(default_factory=list)
+
+    @property
+    def active_application(self) -> str:
+        return self.active_app.name if self.active_app else ""
+
+    @property
+    def active_window(self) -> str:
+        return self.active_app.window_title if self.active_app else ""
+
+    @property
+    def active_process(self) -> str:
+        return self.active_app.process_name if self.active_app else ""
+
+    @property
+    def active_browser(self) -> str:
+        return self.browser_state.browser_name if self.browser_state else ""
+
+    @property
+    def active_url(self) -> str:
+        return self.browser_state.url if self.browser_state else ""
+
+    @property
+    def active_tab(self) -> str:
+        return self.browser_state.tab_title if self.browser_state else ""
+
+    @property
+    def current_task(self) -> str | None:
+        return self.active_task
+
     def is_browser_active(self) -> bool:
         """Check if the current foreground is a browser."""
         if self.active_app and self.active_app.app_type == "browser":

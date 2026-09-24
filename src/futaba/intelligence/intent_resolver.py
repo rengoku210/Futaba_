@@ -517,13 +517,17 @@ class IntentResolver:
 
                 if in_browser or verb in ("search", "search for", "look up", "look for"):
                     query_text = raw
-                    # Extract the query part after the verb
-                    for v in _BROWSER_INTERACTION_VERBS:
+                    # Extract the query part after the longest matching verb
+                    sorted_verbs = sorted(_BROWSER_INTERACTION_VERBS, key=len, reverse=True)
+                    for v in sorted_verbs:
                         vp = f"{v} "
                         idx = lower.find(vp)
                         if idx >= 0:
                             query_text = raw[idx + len(vp):].strip()
                             break
+
+                    if query_text.lower().startswith("for "):
+                        query_text = query_text[4:].strip()
 
                     action = verb.replace(" ", "_")
                     if verb in ("search", "search for", "look up", "look for", "find"):
@@ -544,11 +548,12 @@ class IntentResolver:
         return None
 
     def _check_task_execution(self, lower: str, raw: str) -> ResolvedIntent | None:
-        """Check for task execution: typing, clicking, pressing keys."""
+        """Check for task execution: typing, clicking, pressing keys, downloading, installing."""
         task_indicators = [
-            "type ", "write into", "type into", "click on",
+            "type ", "write into", "type into", "click on", "click ",
             "press ", "save as", "create a ", "delete the ",
-            "organize ", "drag ", "move the ",
+            "organize ", "drag ", "move the ", "download ", "install ",
+            "configure ", "recreate ", "compare ", "verify that ",
         ]
         if any(kw in lower for kw in task_indicators):
             return ResolvedIntent(
@@ -569,9 +574,19 @@ class IntentResolver:
         last_action: str,
         last_intent: str,
     ) -> ResolvedIntent | None:
-        """Detect follow-up commands."""
+        """Detect follow-up commands, delegating to action resolvers if command follows."""
         for prefix in _FOLLOW_UP_PREFIXES:
             if lower.startswith(prefix):
+                sub_lower = lower[len(prefix):].strip()
+                sub_raw = raw[len(prefix):].strip()
+                # If follow-up contains an explicit launch/navigate (e.g. "now open YouTube")
+                if any(sub_lower.startswith(lp) for lp in ("open ", "launch ", "start ", "go to ")):
+                    nav_intent = self._check_launch_or_navigate(
+                        sub_lower, sub_raw, "", "", target_application, ""
+                    )
+                    if nav_intent:
+                        return nav_intent
+
                 return ResolvedIntent(
                     category=IntentCategory.FOLLOW_UP,
                     target_application=target_application or None,

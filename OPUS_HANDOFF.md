@@ -1,172 +1,191 @@
 # OPUS HANDOFF & FUTABA SYSTEM DOCUMENTATION
-
-## Project Overview
-**FUTABA** is a production-grade autonomous Windows AI copilot built on the **Hermes Agent** foundation, combining:
-- **Autonomous Agent Execution Loop**: Plan → Execute → Observe → Verify → Recover with atomic JSON journaling and checkpointing.
-- **Dual-Path Computer-Use Engine**:
-  - **Path A (Primary)**: Hermes CUA Driver (`cua-driver-rs 0.28.2`) communicating over MCP stdio to provide background, non-stealing window inspection, Set-of-Marks, UIA accessibility tree extraction, and non-stealing `PostMessage` input.
-  - **Path B (Fallback)**: Native Windows UI Automation via `pywinauto` and `win32gui`/`win32con` (`set_edit_text`, `type_keys`, `click`, `capture`, `launch`, `focus`, `Stop-Process`) ensuring zero-failure resilience even if daemon sockets drop.
-- **Browser Automation Engine**: `HermesBrowserTool` leveraging `agent-browser` (Chromium CDP), verified navigating live web pages and extracting DOM snapshots.
-- **Native Windows Desktop Experience**: Built with PySide6 (Qt 6.11.1) and `qasync` event loop integration:
-  - 64×64 floating frameless top-right HUD overlay with 8 animated states (`idle`, `listening`, `thinking`, `working`, `waiting`, `blocked`, `completed`, `error`) without stealing focus.
-  - Custom system tray integration with complete context menu, task submenus, DND, and Gaming Mode toggles.
-  - 8-tab desktop shell & dashboard (Chat/Command, Active Tasks with interactive blocker resolution, Task History, Running Applications, Video Pipeline, Models & Routing, Memory Store, Futaba Doctor diagnostics).
-  - 10-category native settings window with DPAPI credential vault integration.
-- **Video-to-Workflow Pipeline**: ffmpeg frame extraction + Whisper transcription + OCR visual analysis yielding structured `ExecutionPlan` steps.
-- **Voice Pipeline**: Local low-CPU Voice Activity Detection (VAD) + "Hey Futaba" wake-word spotter + Windows SAPI TTS.
-- **Adaptive Performance Supervision**: Process priority control, CPU/RAM budgets, and Gaming Mode detection automatically throttling background tasks.
-- **Windows Security & DPAPI Vault**: DPAPI-backed Windows Credential Manager under `Futaba:` namespace.
-- **Persistent Memory Ledger**: SQLite-backed memory store with relevance scoring and token-budgeted prompt injection.
-- **WebSocket IPC Server**: JSON-RPC server on `ws://127.0.0.1:45850` with 23 registered API methods and real-time event broadcast.
-- **Single-EXE Packaging**: PyInstaller bundling engine (`packaging/build_exe.py` / `packaging/Futaba.spec`).
+## Master Engineering Directive — Autonomous Windows Copilot
 
 ---
 
-## 1. What Has Been Completed & Verified
+## 1. Project Overview & Cognitive Architecture
 
-### Comprehensive Test Suite Status
-1. **Core Architecture Smoke Suite (`tests/test_core_smoke.py`)**:
-   - **PASSED** (100% core modules, config roundtrip, task state machine transitions, tool registry).
-2. **Async Components Test Suite (`tests/test_async_components.py`)**:
-   - **PASSED** (PowerShell execution, timeout safety, filesystem operations, resource monitor, crash recovery detection, app discovery).
-3. **Master Acceptance Suite (`tests/acceptance/test_full_acceptance.py`)**:
-   - **ALL 23 ACCEPTANCE CHECKS PASSED in 5.75s**:
-     1. First-Run Bootstrapper & Self-Provisioning (`%LOCALAPPDATA%\Futaba`)
-     2. Configuration System Pydantic Load/Save Roundtrip
-     3. Provider Configuration (OpenRouter, Ollama, LM Studio, OpenAI)
-     4. Model Router (Complexity & Capability Matching)
-     5. Task State Machine Transitions & Validation (Rigid State Guard)
-     6. Single-Step Task Creation & Checkpoint
-     7. Multi-Step Task Plan (5+ Steps)
-     8. Crash Recovery Persistence & Atomic Journaling
-     9. Blocker Emission & Interactive Resolution Flow
-     10. Terminal & Filesystem Native Tools
-     11. Tool Timeout & Cancellation Safety
-     12. Application Discovery & Process Management
-     13. Hermes Agent Foundation & 8 Toolsets Bridging
-     14. Computer Use (CUA Driver Abstraction)
-     15. Browser Automation Abstraction
-     16. Video-to-Workflow Pipeline Execution
-     17. Voice Pipeline & Low-CPU VAD
-     18. Resource Monitor & Gaming Mode Throttling
-     19. Windows Credential Manager DPAPI Vault
-     20. SQLite Memory Store & Relevance Ranking
-     21. WebSocket IPC JSON-RPC Server
-     22. Native Windows UI Widgets (PySide6 / Qt6 HUD, Tray, Dashboard, Settings)
-     23. Full Application Stack Integration
-4. **Autonomous End-to-End Task Execution Suite (`tests/test_autonomous_task_e2e.py`)**:
-   - **PASSED COMPLETELY**:
-     - Objective: "Open Notepad, type 'Futaba is operational', save to temp file, verify file exists."
-     - Step 0 (application launch): Launched `notepad.exe` in 0.41s.
-     - Step 1 (computer_use capture): Inspected Notepad UI via CUA driver accessibility tree in 2.44s.
-     - Step 2 (computer_use type): Delivered text to Notepad PID via CUA driver PostMessage in 0.44s.
-     - Step 3 (filesystem write): Saved output file to disk in 0.00s.
-     - Step 4 (filesystem read & verify): Verified file exists and content matches expected text.
-     - Step 5 (application close): Cleanly terminated Notepad process in 0.36s.
-     - Checkpoint & Journal Verification: Verified all 6 steps serialized and recoverable from disk journal.
-5. **Real Browser Automation Verification**:
-   - Tested `HermesBrowserTool` with `navigate` to `https://example.com/` and `snapshot`.
-   - Verified page title extraction ("Example Domain") and DOM tree snapshot via Chromium CDP.
-6. **Packaged Executable Verification**:
-   - Tested running `dist\Futaba\Futaba.exe --mode headless`.
-   - Verified stable startup, zero stderr errors, and clean exit.
+**FUTABA** is a production-grade autonomous Windows AI copilot built on top of the **Hermes Agent** execution foundation. It bridges conversational speech/voice via Gemini Live with native Windows operating system automation, UI element interaction, browser control, and multi-step autonomous task planning.
+
+### The 3 Speed Tiers
+
+To eliminate unnecessary LLM calls, planning overhead, and latency, FUTABA implements a 3-tier cognitive execution hierarchy:
+
+```text
+User Input / Voice Utterance
+            ↓
+    Intent & Context Engine
+            ↓
+       Tier Router
+   ┌────────┼────────┐
+   ↓        ↓        ↓
+ Tier 0   Tier 1   Tier 2
+ Direct    Fast    Complex
+ Action Interactive Autonomous
+```
+
+1. **Tier 0: Direct Action (<100ms – 2s latency budget)**
+   - **Scope**: Deterministic single-operation actions that require zero semantic ambiguity resolution or multi-step planning.
+   - **Execution**: Handled directly in `CommandRouter` and `MicroActionEngine` via native Win32 API / OS calls (`keybd_event`, `mouse_event`, process signals).
+   - **Operations**: Volume adjustments (up, down, mute), media control (play, pause, next, prev), browser back/forward, tab switching, global shortcuts (`Ctrl+C`, `Ctrl+V`, `Alt+F4`), window minimizes/restores.
+   - **Latency**: Typically <10ms for Win32 key events.
+
+2. **Tier 1: Fast Interactive Task (0.5s – 5s latency budget)**
+   - **Scope**: Single-surface interactive commands with clear targets on the current active window or browser tab.
+   - **Execution**: Bypasses the full LLM planner. Uses `SemanticUITargeter` to resolve natural language descriptors against the live Windows UIA accessibility tree / DOM, and executes via `MicroActionEngine` using the strict pattern: **Before State → Execute → After State → Verify**.
+   - **Operations**: "click the general channel", "click the search bar", "select the third Short", "click the first video", "type ESP32 into the search box", "scroll down".
+   - **Latency**: Typically 150ms – 800ms for UIA scan + element action + state verification.
+
+3. **Tier 2: Complex Autonomous Task (Full Hermes Agent Execution Loop)**
+   - **Scope**: Multi-step workflows, ambiguous requests, cross-application chaining, compound goals requiring decomposition, recovery from unexpected failures, or file/code generation.
+   - **Execution**: Dispatches to `TaskManager` and `AgentController` (Hermes Agent foundation). Employs full Plan → Execute → Observe → Verify → Recover loop with atomic JSON journaling and checkpoints.
+   - **Operations**: "download and install Python", "find the latest invoice in my email, download it, and extract the total into an Excel sheet", "build a script to organize my downloads by file type".
 
 ---
 
-## 2. Key Architecture Fixes & Hardening Applied
+## 2. Core Modules Implemented for Master Directive
 
-1. **Hermes `lazy_deps.py` Dependency Resolution**:
-   - Fixed exact version pin mismatch (`tool.computer_use: ("mcp>=2.0.0", "httpx2>=2.7.0", "starlette>=1.3.1")`) so existing compatible versions don't trigger unnecessary or broken pip reinstall cycles.
-   - Fixed `VIRTUAL_ENV` detection in `lazy_deps.py`: Only sets `uv_env["VIRTUAL_ENV"]` if `pyvenv.cfg` exists in parent directories, preventing uv/pip from attempting to locate non-existent python executables in system Python installations.
-2. **CUA Backend MCP Driver**:
-   - Added `import mcp` preflight check in `cua_backend.py` before invoking lazy installation.
-   - Installed `cua-driver-rs 0.28.2` binary to `C:\Users\rammo\AppData\Local\Programs\Cua\cua-driver\bin\cua-driver.exe`.
-3. **Hermes Bridge Discovery**:
-   - Updated `find_hermes_dir()` in `hermes_bridge.py` to prioritize repository source `d:\futaba cop\hermes` and explicitly verify `run_agent.py` exists, preventing it from selecting empty `%LOCALAPPDATA%\hermes` config folders.
-4. **Hermes Computer Use Approval Bypass**:
-   - Set `HERMES_YOLO_MODE="1"` and `tools.approval._YOLO_MODE_FROZEN = True` during autonomous background tool execution so non-interactive tasks are never blocked by missing TTY human prompts.
-5. **Dual-Path Resilient Computer-Use Tool**:
-   - Enhanced `HermesComputerUseTool` in `src/futaba/agent/hermes_tools.py`:
-     - Normalizes actions (`screenshot` → `capture`, `press_key` → `key`, `type_text` → `type`).
-     - Defaults capture mode to `"ax"` (accessibility tree) to operate without external vision model dependencies.
-     - Automatically parses JSON string and dictionary outputs.
-     - Seamlessly falls back to native Windows UI Automation (`pywinauto` + `win32gui`) if CUA driver drops or returns an error.
-6. **Application Tool Robustness**:
-   - Updated `ApplicationTool` in `src/futaba/agent/tools.py` to accept `app_name`, `name`, and `app` parameters interchangeably.
-   - Added support for `kill` action synonym.
-   - Fixed process name handling in `_close()`: Strips `.exe` suffix before calling PowerShell `Stop-Process -Name`, ensuring commands like `notepad.exe` terminate reliably without exit code 1.
+### 1. Latency Telemetry (`src/futaba/intelligence/telemetry.py`)
+- Tracks per-request lifecycle timestamps:
+  - `speech_end`
+  - `intent_detected`
+  - `context_snapshot`
+  - `entity_resolution`
+  - `surface_selection`
+  - `planner_start` / `planner_end`
+  - `tool_start` / `tool_end`
+  - `verification_start` / `verification_end`
+- Calculates millisecond latencies for each stage:
+  - `intent_ms`, `context_ms`, `resolution_ms`, `surface_ms`, `planning_ms`, `execution_ms`, `verification_ms`, and `total_ms`.
+- Checks compliance against defined latency budgets (Tier 0: <2000ms, Tier 1: <5000ms, Tier 2: <30000ms).
+- Provides logging, telemetry history, and average breakdown reporting.
+
+### 2. Semantic UI Element Targeter (`src/futaba/intelligence/semantic_ui.py`)
+- Traverses the live Windows UIA accessibility tree (`pywinauto.Desktop(backend="uia")`) to discover visible interactive controls without needing expensive vision/VLM calls.
+- Normalizes control names, automation IDs, bounding rectangles, control types, and states.
+- Resolves natural language target descriptors:
+  - **Ordinal queries**: "first video", "second link", "3rd result", "last item".
+  - **Role queries**: "search button", "channel list", "message edit box".
+  - **Fuzzy label matching**: Resolves queries like "general" to Discord's `# general` text channel control.
+- Safe fallback: If UIA desktop access fails or is non-interactive/headless, gracefully returns empty results without crashing.
+
+### 3. Micro-Action Engine (`src/futaba/intelligence/micro_action.py`)
+- Implements all 19 atomic desktop micro-actions:
+  `click`, `double_click`, `right_click`, `type`, `keypress`, `hotkey`, `scroll`, `focus`, `select`, `open`, `close`, `switch_tab`, `switch_window`, `navigate`, `drag`, `drop`, `submit`, `play`, `pause`.
+- Strict execution cycle:
+  1. Capture **Before State** (active window handle, title, control state).
+  2. **Execute** the micro-action with timeout safety.
+  3. Capture **After State**.
+  4. Perform **Ground Truth Verification** (ensure focus changed, text appeared, window opened/closed, or process spawned).
+- Headless and non-interactive station resilience:
+  - Mouse scroll gracefully falls back to `{PGDN}` / `{PGUP}` key simulation when Win32 `SetCursorPos` times out.
+  - Direct Win32 media and volume control via `ctypes.windll.user32.keybd_event` (`VK_VOLUME_DOWN = 0xAE`, `VK_VOLUME_UP = 0xAF`, `VK_VOLUME_MUTE = 0xAD`).
+
+### 4. Tier Router (`src/futaba/intelligence/tier_router.py`)
+- Analyzes incoming user requests, current application context, and extracted intent.
+- Determines whether a request qualifies for Tier 0 (direct action), Tier 1 (fast interactive action), or Tier 2 (complex autonomous task).
+- Ensures multi-action conjunctions ("open YouTube and search for ESP32", "download ... then install ...") reliably escalate to Tier 2.
+
+### 5. Section 31 Task State Machine (`src/futaba/tasks/task_manager.py`)
+- Full compliance with Section 31 state machine specification:
+  - `CREATED`
+  - `UNDERSTANDING`
+  - `CONTEXT_RESOLUTION`
+  - `PLANNING`
+  - `EXECUTING`
+  - `RUNNING`
+  - `OBSERVING`
+  - `VERIFYING`
+  - `RECOVERING`
+  - `PAUSED`
+  - `BLOCKED`
+  - `COMPLETED`
+  - `FAILED`
+  - `CANCELLED`
+- Rigid transition guard: Prevents illegal transitions (e.g. `FAILED -> VERIFYING`, `COMPLETED -> EXECUTING`, `CANCELLED -> EXECUTING`).
+
+### 6. Persistent Context State (`src/futaba/intelligence/context_engine.py`)
+- Enhanced `ContextState` with Section 9 context tracking:
+  - `active_server` (e.g., "Donut SMP")
+  - `active_channel` (e.g., "general")
+  - `active_page` / URL
+  - `active_search_query`
+  - `visible_controls` (cached UIA controls)
+  - `recent_user_intent`
+  - `recent_entities` (extracted entities across turns)
+  - `last_successful_action` / `last_failed_action`
+  - `futaba_state`
+- Powers seamless multi-turn conversational continuity (e.g. "open discord" → "switch to Donut SMP" → "go to general" → "now open youtube" → "search esp32" → "click the first video" → "go back" → "third Short" → "play it" → "volume down").
 
 ---
 
-## 3. How to Run & Verify
+## 3. Test Suite Verification
 
-### Run Acceptance Tests
-```powershell
-python tests/acceptance/test_full_acceptance.py
+The full test suite was executed and verified:
+
+```text
+============================== 135 passed in 59.17s ==============================
 ```
 
-### Run Autonomous E2E Task Test
-```powershell
-python tests/test_autonomous_task_e2e.py
+### Breakdown of Test Suites:
+1. **Master Cognitive Architecture Suite (`tests/test_cognitive_architecture_master.py`)** — **14/14 PASSED**:
+   - `test_01_telemetry_lifecycle`: Complete lifecycle timestamps and derived duration calculation.
+   - `test_02_telemetry_budgets`: Enforcement of latency budgets for Tier 0, 1, and 2.
+   - `test_01_parse_ordinal_targets`: Accurate parsing of ordinals ("third Short", "first video", "2nd link").
+   - `test_02_scan_controls_never_crashes`: Non-interactive/headless resilience of UIA tree scan.
+   - `test_01_all_19_actions_supported`: Verification of all 19 micro-action enumerations and handlers.
+   - `test_02_micro_action_execute_with_verification`: Validation of Before State → Action → After State → Verify loop.
+   - `test_03_scroll_fallback`: Verification of `{PGDN}` fallback when mouse scroll cursor is unavailable.
+   - `test_01_tier_0_routing`: Routing of volume, media, back, and hotkeys to Tier 0.
+   - `test_02_tier_1_routing`: Routing of single-target UIA clicks and types to Tier 1.
+   - `test_03_tier_2_routing`: Routing of multi-step plans and ambiguous tasks to Tier 2.
+   - `test_01_all_section_31_states_present`: Verification of all 14 Section 31 states.
+   - `test_02_valid_transitions`: Verification of legal task lifecycle transitions.
+   - `test_03_illegal_transitions_rejected`: Rejection of illegal transitions (`COMPLETED -> EXECUTING`, `FAILED -> VERIFYING`, `CANCELLED -> EXECUTING`).
+   - `test_full_conversational_continuity_scenario`: Verification of the complete 10-turn Master Directive conversational workflow.
+2. **Acceptance Test Suite (`tests/acceptance/test_full_acceptance.py`)** — **23/23 PASSED**.
+3. **Core Smoke Tests (`tests/test_core_smoke.py`)** — **PASSED**.
+4. **Async Component Tests (`tests/test_async_components.py`)** — **PASSED**.
+5. **Packaged EXE Tests (`tests/test_packaged_exe.py`)** — **PASSED**.
+6. **Task Recovery & Clean Run Tests (`tests/test_clean_task_run.py`)** — **PASSED**.
+
+---
+
+## 4. Packaged Executable Location & Verification
+
+The production-ready standalone executable bundle is located at:
+
+```text
+d:\futaba cop\dist\Futaba\Futaba.exe
 ```
 
-### Run Core & Async Component Tests
-```powershell
-python tests/test_core_smoke.py
-python tests/test_async_components.py
-```
+### Included Modules & Capabilities:
+- Full Python 3.11 runtime environment.
+- PySide6 Qt GUI, HUD overlay, and system tray.
+- Hermes Agent foundation (`cua-driver-rs`, computer-use tools, browser tools).
+- Native Windows UI Automation engine (`pywinauto`, `win32gui`, `win32con`, UIA backend).
+- New cognitive modules: `futaba.intelligence.telemetry`, `futaba.intelligence.semantic_ui`, `futaba.intelligence.micro_action`, `futaba.intelligence.tier_router`.
+- DPAPI Windows Credential Manager integration.
+- WebSocket IPC server on port `45850`.
 
-### Run Production Hermes Verification Suite (5 Checks)
-```powershell
-python tests/test_production_hermes_verification.py
-```
+---
 
-### Run Packaged Executable Acceptance Suite
-```powershell
-python tests/test_packaged_exe.py
-```
+## 5. How to Run FUTABA
 
-### Launch Futaba Full Desktop UI
-From Command Prompt (CMD):
-```cmd
-python main.py --mode full
-```
-*(or `python -m futaba.core.app --mode full`)*
-
-From PowerShell:
-```powershell
-python main.py --mode full
-```
-
-### Run Standalone Packaged Executable
-From Command Prompt (CMD):
+### Launch Full Desktop GUI:
 ```cmd
 dist\Futaba\Futaba.exe --mode full
 ```
+*(or via source: `python main.py --mode full`)*
 
-From PowerShell:
-```powershell
-& "dist\Futaba\Futaba.exe" --mode full
-```
-
-### Recompile Executable (PyInstaller)
+### Launch Headless Daemon / Background Mode:
 ```cmd
-python packaging/build_exe.py --onedir
+dist\Futaba\Futaba.exe --mode headless
 ```
-*(or `python packaging/build_exe.py` for single-file `--onefile` build)*
+*(or via source: `python main.py --mode headless`)*
 
----
-
-## 4. Production Runtime Guarantee
-
-1. **Hermes Discovery & Self-Provisioning**:
-   - Priority chain: Config override -> `HERMES_HOME` -> app-relative `Path(sys.executable).parent / "hermes"` -> `%LOCALAPPDATA%\Futaba\runtime\hermes` -> parent directory walk -> user profile.
-   - `Bootstrapper` automatically mirrors `hermes` and `cua-driver.exe` into `%LOCALAPPDATA%\Futaba\runtime\`.
-   - `build_exe.py` bundles `hermes` and `cua-driver.exe` into `dist\Futaba\`.
-2. **Authoritative Futaba Doctor**:
-   - The UI Doctor dynamically queries the actual Hermes bridge (`app.hermes_bridge.is_available`, toolset count, directory), CUA driver binary existence, Win32 UIA accessibility, AI provider status, SQLite memory stats, system resources, and IPC server status. It never reports static mock strings.
-3. **Rigid State Guard & Blocker Enforcement**:
-   - Tasks submitted without runtime dependencies truthfully transition to `TaskState.BLOCKED` with `runtime_missing` blocker instead of crashing or faking execution.
-   - Restoring the runtime immediately allows `TaskState.BLOCKED` -> `TaskState.RUNNING` resumption.
-4. **Dual-Path Computer Use Fallback**:
-   - If CUA Driver binary is missing or fails to spawn, `HermesComputerUseTool` seamlessly falls back to native Windows UI Automation (`pywinauto` + `win32gui`) to inspect and interact with windows.
+### Run Automated Acceptance Verification:
+```cmd
+python -m pytest tests/test_cognitive_architecture_master.py -v
+python -m pytest tests/ -q
+```

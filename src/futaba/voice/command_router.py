@@ -299,6 +299,77 @@ class VoiceCommandRouter:
                             "required": ["query"],
                         },
                     },
+                    {
+                        "name": "click_element",
+                        "description": (
+                            "Click a specific UI control, video, link, channel, or button by natural description. "
+                            "Examples: 'third Short', 'first video', 'second result', 'download button', 'play button', 'settings'."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "target": {
+                                    "type": "STRING",
+                                    "description": "Semantic description of the element to click (e.g. 'third Short', 'first video', 'Donut SMP').",
+                                },
+                            },
+                            "required": ["target"],
+                        },
+                    },
+                    {
+                        "name": "type_text",
+                        "description": "Type text into the focused control or specific target input box (e.g. search box).",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "text": {
+                                    "type": "STRING",
+                                    "description": "The exact text to type.",
+                                },
+                                "target": {
+                                    "type": "STRING",
+                                    "description": "Optional descriptor of the control to type into (e.g. 'search box').",
+                                },
+                            },
+                            "required": ["text"],
+                        },
+                    },
+                    {
+                        "name": "media_control",
+                        "description": "Control audio/video playback or volume. Actions: 'play', 'pause', 'mute', 'unmute', 'volume_up', 'volume_down'.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "action": {
+                                    "type": "STRING",
+                                    "description": "Action to perform: 'play', 'pause', 'mute', 'unmute', 'volume_up', 'volume_down'.",
+                                },
+                            },
+                            "required": ["action"],
+                        },
+                    },
+                    {
+                        "name": "go_back",
+                        "description": "Navigate back in the active application or browser history (equivalent to browser back button or Alt+Left).",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {},
+                        },
+                    },
+                    {
+                        "name": "scroll_page",
+                        "description": "Scroll the current window or page up or down.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "direction": {
+                                    "type": "STRING",
+                                    "description": "Direction to scroll: 'up' or 'down'.",
+                                },
+                            },
+                            "required": ["direction"],
+                        },
+                    },
                 ]
             }
         ]
@@ -470,7 +541,24 @@ class VoiceCommandRouter:
 
         logger.info("In-app navigation: target=%s, app=%s", target, app)
 
-        # Strategy 1: Submit as a context-aware task to Hermes
+        # Tier 1 fast-path: Attempt direct UIA semantic targeting first (<500ms)
+        try:
+            from futaba.intelligence.micro_action import get_micro_action_engine
+            micro_engine = get_micro_action_engine()
+            fast_res = await micro_engine.execute_micro_action("click", target)
+            if fast_res.success and fast_res.verified:
+                self._context.record_action(f"navigated to {target} in {app}", target_app=app)
+                return {
+                    "status": "success",
+                    "message": f"Navigated to {target} in {app}.",
+                    "target": target,
+                    "app": app,
+                    "evidence": fast_res.evidence,
+                }
+        except Exception as e:
+            logger.debug("Tier 1 fast-path in-app navigation error: %s; falling back to TaskManager", e)
+
+        # Strategy 2: Submit as a context-aware task to Hermes
         # Build a specific instruction that references the current app context
         if app:
             instruction = f"In the {app} application, navigate to '{target}'. Do NOT open a browser. Do NOT launch a new application. Stay within {app}."
@@ -595,7 +683,91 @@ class VoiceCommandRouter:
             except Exception as e:
                 logger.error("interact_with_app task failed: %s", e)
 
-        return {"status": "error", "message": f"Could not read content from {app}."}
+    async def _handle_click_element(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Click a specific UI control, video, link, or button by natural description."""
+        target = args.get("target", "").strip()
+        if not target:
+            return {"status": "error", "message": "No target specified to click."}
+
+        from futaba.intelligence.micro_action import get_micro_action_engine
+        micro_engine = get_micro_action_engine()
+        res = await micro_engine.execute_micro_action("click", target)
+        if res.success:
+            self._context.record_action(f"clicked {target}")
+            return {
+                "status": "success",
+                "message": f"Clicked {target}.",
+                "evidence": res.evidence,
+            }
+        return {"status": "error", "message": res.error or f"Could not find or click '{target}'."}
+
+    async def _handle_type_text(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Type text into focused control or specific target input box."""
+        text = args.get("text", "")
+        target = args.get("target", "")
+        if not text:
+            return {"status": "error", "message": "No text provided to type."}
+
+        from futaba.intelligence.micro_action import get_micro_action_engine
+        micro_engine = get_micro_action_engine()
+        res = await micro_engine.execute_micro_action("type", target or text, text=text)
+        if res.success:
+            self._context.record_action(f"typed into {target or 'field'}")
+            return {"status": "success", "message": "Typed text.", "evidence": res.evidence}
+        return {"status": "error", "message": res.error or "Failed to type text."}
+
+    async def _handle_media_control(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Control audio/video playback or volume."""
+        action = args.get("action", "").lower().strip()
+        from futaba.intelligence.micro_action import get_micro_action_engine
+        micro_engine = get_micro_action_engine()
+
+        if action in ("play", "pause"):
+            res = await micro_engine.execute_micro_action(action)
+            self._context.record_action(f"media {action}")
+            return {"status": "success", "message": f"Media {action}ed."}
+        elif action in ("volume_down", "volume down", "down"):
+            import ctypes
+            VK_VOLUME_DOWN = 0xAE
+            for _ in range(3):
+                ctypes.windll.user32.keybd_event(VK_VOLUME_DOWN, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(VK_VOLUME_DOWN, 0, 2, 0)
+            self._context.record_action("volume down")
+            return {"status": "success", "message": "Volume decreased."}
+        elif action in ("volume_up", "volume up", "up"):
+            import ctypes
+            VK_VOLUME_UP = 0xAF
+            for _ in range(3):
+                ctypes.windll.user32.keybd_event(VK_VOLUME_UP, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(VK_VOLUME_UP, 0, 2, 0)
+            self._context.record_action("volume up")
+            return {"status": "success", "message": "Volume increased."}
+        elif action in ("mute", "unmute"):
+            import ctypes
+            VK_VOLUME_MUTE = 0xAD
+            ctypes.windll.user32.keybd_event(VK_VOLUME_MUTE, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(VK_VOLUME_MUTE, 0, 2, 0)
+            self._context.record_action("volume mute toggle")
+            return {"status": "success", "message": "Volume toggled."}
+        return {"status": "error", "message": f"Unknown media action: {action}"}
+
+    async def _handle_go_back(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Navigate back in active application or browser history."""
+        from futaba.intelligence.micro_action import get_micro_action_engine
+        micro_engine = get_micro_action_engine()
+        res = await micro_engine.execute_micro_action("hotkey", "%{LEFT}")
+        self._context.record_action("navigated back")
+        return {"status": "success", "message": "Navigated back."}
+
+    async def _handle_scroll_page(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Scroll the current window or page up or down."""
+        direction = args.get("direction", "down").lower()
+        amount = int(args.get("amount", 3))
+        from futaba.intelligence.micro_action import get_micro_action_engine
+        micro_engine = get_micro_action_engine()
+        res = await micro_engine.execute_micro_action("scroll", direction=direction, amount=amount)
+        self._context.record_action(f"scrolled {direction}")
+        return {"status": "success", "message": f"Scrolled {direction}."}
 
     async def _handle_go_to_sleep(self, args: dict[str, Any]) -> dict[str, Any]:
         """Put Futaba to sleep / dormant mode."""
