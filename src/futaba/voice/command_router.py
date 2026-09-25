@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Callable, Awaitable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -384,13 +385,41 @@ class VoiceCommandRouter:
         # Refresh context state before handling
         self._context.update()
 
+        start_t = time.monotonic()
         handler = getattr(self, f"_handle_{name}", None)
         if handler:
             try:
                 result = await handler(args)
+                elapsed_ms = (time.monotonic() - start_t) * 1000
                 logger.info("Tool call %s completed successfully: %s", name, str(result)[:100])
+
+                # Structured Observability Audit (Requirement 39)
+                try:
+                    from futaba.intelligence.observability import get_command_observer, CommandAuditRecord
+                    observer = get_command_observer()
+                    status = result.get("status", "success")
+                    record = CommandAuditRecord(
+                        user_utterance=f"{name}({args})",
+                        intent=name.upper(),
+                        entity=str(args.get("name") or args.get("target") or args.get("url") or args.get("query") or args.get("action") or ""),
+                        current_app=self._context.get_active_app_name() or "Windows Desktop",
+                        current_window=self._context.state.active_window or "Unknown",
+                        context=self._context.get_target_app(),
+                        execution_surface="NATIVE_WINDOWS",
+                        action=f"execute {name}",
+                        expected_result=f"{name} success",
+                        observed_result=str(result.get("message", ""))[:120],
+                        verification="PASS" if status == "success" else "FAIL",
+                        latency_ms=elapsed_ms,
+                        final_result="SUCCESS" if status == "success" else "FAILURE",
+                    )
+                    observer.record(record)
+                except Exception as ex:
+                    logger.debug("Observability audit recording notice: %s", ex)
+
                 return result
             except Exception as e:
+                elapsed_ms = (time.monotonic() - start_t) * 1000
                 logger.error("Tool call %s failed: %s", name, e, exc_info=True)
                 return {"status": "error", "message": f"Execution failed: {str(e)}"}
         else:
@@ -464,7 +493,7 @@ class VoiceCommandRouter:
                     "app": target_app,
                 })
 
-        # First consult SystemContextTracker to prevent duplicate windows and reuse open browsers/apps
+        # First consult SystemContextTracker and AppResolver
         try:
             tracker = get_context_tracker()
             res = tracker.open_or_navigate(app_name, new_tab=False, new_window=False)
@@ -477,31 +506,15 @@ class VoiceCommandRouter:
                     "message": res.get("message", f"Opened {app_name}."),
                     "details": res,
                 }
+            else:
+                # App was not found or failed to launch - return failure directly, NEVER fall back to web search
+                return {
+                    "status": "error",
+                    "message": res.get("message", f"Could not find or launch '{app_name}'."),
+                    "details": res,
+                }
         except Exception as e:
             logger.debug("SystemContextTracker open_or_navigate error: %s", e)
-
-        # Try application tool in registry
-        if self.tools:
-            app_tool = self.tools.get("application")
-            if app_tool:
-                res = await app_tool.execute(action="launch", parameters={"name": app_name})
-                if res.success:
-                    # Record in context engine
-                    self._context.record_action(f"opened {app_name}", target_app=app_name)
-                    self._context.mark_app_owned(app_name.lower().replace(" ", "") + ".exe")
-                    return {
-                        "status": "success",
-                        "message": f"I have opened {app_name} on your computer.",
-                        "details": res.output,
-                    }
-
-        # Fallback to direct Windows launch
-        try:
-            import os
-            os.startfile(app_name if app_name.endswith((".exe", ".msc")) else f"{app_name}.exe")
-            self._context.record_action(f"opened {app_name}", target_app=app_name)
-            return {"status": "success", "message": f"I opened {app_name} on your computer."}
-        except Exception as e:
             return {"status": "error", "message": f"Could not launch {app_name}: {e}"}
 
     async def _handle_navigate_browser(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -526,9 +539,6 @@ class VoiceCommandRouter:
         """
         Navigate within the currently active application.
 
-        Uses UIA (pywinauto) for in-app navigation, falling back to CUA (Hermes)
-        if UIA cannot locate the target element.
-
         Examples:
         - Discord: navigate to server "Donut SMP", channel "#general"
         - Spotify: navigate to playlist "My Playlist"
@@ -541,7 +551,38 @@ class VoiceCommandRouter:
 
         logger.info("In-app navigation: target=%s, app=%s", target, app)
 
-        # Tier 1 fast-path: Attempt direct UIA semantic targeting first (<500ms)
+        # Step 0: Ensure the parent application is brought to the foreground first!
+        if app:
+            try:
+                from futaba.system.app_resolver import get_app_resolver
+                resolver = get_app_resolver()
+                resolver.open_or_focus(app)
+            except Exception as e:
+                logger.debug("Could not focus parent app %s: %s", app, e)
+
+        # Discord Fast Switcher: If app is Discord, use Ctrl+K quick switcher
+        if app and "discord" in app.lower():
+            try:
+                import pywinauto.keyboard as keyboard
+                keyboard.send_keys("^k")  # Ctrl+K opens quick switcher
+                await asyncio.sleep(0.3)
+                clean_target = target.replace("#", "").strip()
+                keyboard.send_keys(clean_target, with_spaces=True)
+                await asyncio.sleep(0.4)
+                keyboard.send_keys("{ENTER}")
+                await asyncio.sleep(0.5)
+
+                self._context.record_action(f"navigated to {target} in Discord", target_app="Discord")
+                return {
+                    "status": "success",
+                    "message": f"Switched to {target} in Discord.",
+                    "target": target,
+                    "app": "Discord",
+                }
+            except Exception as e:
+                logger.debug("Discord quick switcher error: %s; falling back to UIA", e)
+
+        # Tier 1 fast-path: Attempt direct UIA semantic targeting (<500ms)
         try:
             from futaba.intelligence.micro_action import get_micro_action_engine
             micro_engine = get_micro_action_engine()
@@ -556,59 +597,14 @@ class VoiceCommandRouter:
                     "evidence": fast_res.evidence,
                 }
         except Exception as e:
-            logger.debug("Tier 1 fast-path in-app navigation error: %s; falling back to TaskManager", e)
+            logger.debug("Tier 1 fast-path in-app navigation error: %s", e)
 
-        # Strategy 2: Submit as a context-aware task to Hermes
-        # Build a specific instruction that references the current app context
-        if app:
-            instruction = f"In the {app} application, navigate to '{target}'. Do NOT open a browser. Do NOT launch a new application. Stay within {app}."
-        else:
-            instruction = f"Navigate to '{target}' within the current application."
-
-        # Submit as task
-        if self.task_manager:
-            try:
-                task = self.task_manager.create_task(
-                    instruction,
-                    origin="voice_navigate_in_app",
-                    priority=3,  # Higher priority for direct user requests
-                )
-                self._context.record_action(
-                    f"navigating to {target} in {app}",
-                    target_app=app,
-                )
-
-                # Wait briefly for completion (fast in-app nav should complete quickly)
-                deadline = asyncio.get_event_loop().time() + 10.0
-                while asyncio.get_event_loop().time() < deadline:
-                    await asyncio.sleep(0.5)
-                    from futaba.tasks.task_manager import TaskState
-                    current = self.task_manager.get_task(task.id)
-                    if not current:
-                        break
-                    if current.state == TaskState.COMPLETED:
-                        return {
-                            "status": "success",
-                            "message": f"Navigated to {target} in {app}.",
-                            "target": target,
-                            "app": app,
-                        }
-                    if current.state in (TaskState.FAILED, TaskState.CANCELLED):
-                        return {
-                            "status": "error",
-                            "message": f"Could not navigate to {target} in {app}: task {current.state.value}",
-                        }
-
-                return {
-                    "status": "running",
-                    "message": f"Navigating to {target} in {app}. This may take a moment.",
-                    "task_id": task.id,
-                }
-            except Exception as e:
-                logger.error("navigate_in_app task submission failed: %s", e)
-                return {"status": "error", "message": f"Navigation failed: {e}"}
-
-        return {"status": "error", "message": "Task manager not available for in-app navigation."}
+        return {
+            "status": "error",
+            "message": f"Could not find or navigate to '{target}' in {app or 'the current application'}.",
+            "target": target,
+            "app": app,
+        }
 
     async def _handle_interact_with_app(self, args: dict[str, Any]) -> dict[str, Any]:
         """

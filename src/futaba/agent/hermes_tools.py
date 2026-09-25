@@ -411,15 +411,24 @@ class HermesComputerUseTool(Tool):
         if normalized_action == "capture" and "mode" not in cua_args:
             cua_args["mode"] = "ax"
 
-        # In test environments only, allow autonomous execution without interactive prompts.
-        # Production environments remain strictly in standard / ask_elevated permission mode.
+        # In test environments, allow automated test execution without interactive human prompts.
         if os.environ.get("FUTABA_ENV") == "test":
-            os.environ["HERMES_YOLO_MODE"] = "1"
             try:
                 import tools.approval as approval
                 approval._YOLO_MODE_FROZEN = True
             except Exception:
                 pass
+
+        # Enforce explicit capability boundary (Requirement 26)
+        allowed_cua_actions = {
+            "inspect", "screenshot", "capture", "click", "type", "key",
+            "press", "move", "drag", "hotkey", "left_click", "press_key"
+        }
+        if normalized_action not in allowed_cua_actions:
+            return ToolResult(
+                success=False,
+                error=f"Action '{normalized_action}' is outside Futaba's configured capability boundary.",
+            )
 
         def _dispatch_cua():
             if not self._bridge.is_available:

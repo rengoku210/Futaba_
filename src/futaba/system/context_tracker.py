@@ -131,51 +131,31 @@ class SystemContextTracker:
         return False, None
 
     def focus_app(self, app_name: str) -> bool:
-        """Focus an existing window for the given application."""
+        """Focus an existing window for the given application with ground-truth verification."""
         clean = app_name.strip()
         try:
-            # 1. Try Windows Script Host AppActivate
+            from futaba.system.app_resolver import get_app_resolver
+            resolver = get_app_resolver()
+            windows = resolver.get_application_windows(app_name=clean)
+            if windows:
+                return resolver.focus_window(windows[0]["hwnd"])
+        except Exception as e:
+            logger.debug("AppResolver focus error: %s", e)
+
+        try:
+            # Fallback to Windows Script Host AppActivate
             cmd = f"(New-Object -ComObject WScript.Shell).AppActivate('{clean}')"
             res = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=3,
             )
             if "True" in res.stdout:
                 logger.info("Focused existing window for %s via AppActivate", clean)
                 return True
         except Exception as e:
             logger.debug("AppActivate error: %s", e)
-
-        # 2. Try Win32 ShowWindow / SetForegroundWindow
-        try:
-            user32 = ctypes.windll.user32
-            found_hwnd = 0
-
-            def enum_cb(hwnd, lparam):
-                nonlocal found_hwnd
-                if user32.IsWindowVisible(hwnd):
-                    length = user32.GetWindowTextLengthW(hwnd) + 1
-                    if length > 1:
-                        buf = ctypes.create_unicode_buffer(length)
-                        user32.GetWindowTextW(hwnd, buf, length)
-                        if clean.lower() in buf.value.lower():
-                            found_hwnd = hwnd
-                            return 0
-                return 1
-
-            WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
-            user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
-
-            if found_hwnd:
-                SW_RESTORE = 9
-                user32.ShowWindow(found_hwnd, SW_RESTORE)
-                user32.SetForegroundWindow(found_hwnd)
-                logger.info("Focused window for %s via Win32 HWND %08X", clean, found_hwnd)
-                return True
-        except Exception as e:
-            logger.debug("Win32 focus error: %s", e)
 
         return False
 
@@ -303,57 +283,29 @@ class SystemContextTracker:
                     return {"status": "error", "message": f"Could not open {target}: {fallback_err}"}
 
         # -------------------------------------------------------------------
-        # CASE 2: DESKTOP APPLICATION (e.g. "Brave", "Notepad", "Calculator")
+        # CASE 2: DESKTOP APPLICATION (e.g. "Roblox", "Discord", "Notepad", "VS Code")
         # -------------------------------------------------------------------
-        is_running, proc_info = self.is_app_running(target)
-
-        if is_running and not new_window:
-            logger.info("Application '%s' is already running; focusing existing instance.", target)
-            focused = self.focus_app(target)
-            self.last_app = target
-            self.last_action_time = time.monotonic()
-            if target.lower() in BROWSER_EXECUTABLES:
-                self.last_browser = target.lower()
-            return {
-                "status": "success",
-                "mode": "focused_existing",
-                "application": target,
-                "message": f"{target.title()} is already open; brought it to the foreground.",
-            }
-
-        # Launch fresh instance
-        logger.info("Launching application: %s", target)
         try:
-            exe_name = target if target.lower().endswith((".exe", ".msc")) else f"{target}.exe"
-            cmd = f"Start-Process '{exe_name}' -ErrorAction Stop"
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-                check=True,
-                timeout=5,
-            )
-            self.last_app = target
-            if target.lower() in BROWSER_EXECUTABLES:
-                self.last_browser = target.lower()
-            self.last_action_time = time.monotonic()
-            return {
-                "status": "success",
-                "mode": "launched_new",
-                "application": target,
-                "message": f"I opened {target.title()} on your computer.",
-            }
-        except Exception as e:
-            # Fallback to os.startfile
-            try:
-                os.startfile(target if target.endswith((".exe", ".msc")) else f"{target}.exe")
-                self.last_app = target
+            from futaba.system.app_resolver import get_app_resolver
+            resolver = get_app_resolver()
+            res = resolver.open_or_focus(target)
+            if res.success:
+                self.last_app = res.display_name
+                if target.lower() in BROWSER_EXECUTABLES:
+                    self.last_browser = target.lower()
+                self.last_action_time = time.monotonic()
+                return res.to_dict()
+            else:
                 return {
-                    "status": "success",
-                    "mode": "launched_startfile",
-                    "application": target,
-                    "message": f"Opened {target.title()}.",
+                    "status": "error",
+                    "action": res.action,
+                    "application": res.display_name,
+                    "message": res.message,
+                    "error": res.error,
                 }
-            except Exception as start_err:
-                return {"status": "error", "message": f"Could not launch {target}: {start_err}"}
+        except Exception as e:
+            logger.error("AppResolver execution failed for '%s': %s", target, e)
+            return {"status": "error", "message": f"Could not launch or focus {target}: {e}"}
 
     def get_installed_applications(self) -> dict[str, str]:
         """

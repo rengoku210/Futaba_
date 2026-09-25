@@ -342,12 +342,19 @@ class AgentController:
 
             # --- PLANNING PHASE ---
             if not task.plan:
-                await self._task_manager.transition(
-                    task.task_id, TaskState.PLANNING, "Generating plan"
-                )
-                await self._emit_status(task.task_id, "Planning...")
+                # Fast path check for deterministic single-step tasks (Requirement 9)
+                deterministic_plan = self._try_synthesize_deterministic_plan(task)
+                if deterministic_plan:
+                    logger.info("Task %s resolved via deterministic fast-path (bypassed LLM planner)", task.task_id[:8])
+                    plan = deterministic_plan
+                else:
+                    await self._task_manager.transition(
+                        task.task_id, TaskState.PLANNING, "Generating plan"
+                    )
+                    await self._emit_status(task.task_id, "Planning...")
 
-                plan = await self._generate_plan(task)
+                    plan = await self._generate_plan(task)
+
                 await self._task_manager.update_plan(task.task_id, plan)
                 task.plan = plan
 
@@ -419,6 +426,136 @@ class AgentController:
     # -----------------------------------------------------------------------
     # Planning
     # -----------------------------------------------------------------------
+
+    def _try_synthesize_deterministic_plan(self, task: Task) -> Optional[ExecutionPlan]:
+        """
+        Fast-path bypass for deterministic single-step tasks (Requirement 9).
+        Target: <100ms routing overhead without invoking heavy LLM planner.
+        Handles:
+        - Open / Launch / Focus application
+        - Close / Kill application
+        - Navigate browser / Open URL
+        - Type text into active window or application
+        - Media controls (play, pause, volume)
+        - Scroll
+        """
+        req = task.user_request.strip()
+        lower = req.lower()
+
+        # Reject compound or multi-step requests
+        compound_indicators = (" and ", " then ", " after that ", " but ", " save it", "copy ", "find ")
+        if any(c in lower for c in compound_indicators):
+            return None
+
+        # 1. Close application: e.g. "close notepad", "kill chrome"
+        m_close = re.match(r"^(?:close|kill|exit|quit)\s+([a-zA-Z0-9_\-\. ]+)$", lower)
+        if m_close:
+            app_name = m_close.group(1).strip()
+            plan = ExecutionPlan(
+                objective=req,
+                validation_criteria=[f"Process {app_name} terminated"],
+                estimated_duration_minutes=1,
+            )
+            step = ExecutionStep(
+                index=0,
+                description=f"Close application '{app_name}'",
+                tool="application",
+                action="close",
+                parameters={"name": app_name},
+                verification=f"Process {app_name} is no longer running",
+                idempotent=True,
+            )
+            plan.steps.append(step)
+            task.model_used = "deterministic_fast_path"
+            return plan
+
+        # 2. Open / Launch / Focus application: e.g. "open notepad", "open roblox", "launch discord"
+        m_open = re.match(r"^(?:open|launch|start|focus)\s+([a-zA-Z0-9_\-\. ]+)$", lower)
+        if m_open:
+            app_name = m_open.group(1).strip()
+            if app_name not in ("tab", "window", "url", "website", "file", "document"):
+                # Check if it's a web destination
+                from futaba.system.context_tracker import get_context_tracker
+                tracker = get_context_tracker()
+                is_web, url = tracker.is_web_destination(app_name)
+                if is_web:
+                    plan = ExecutionPlan(
+                        objective=req,
+                        validation_criteria=[f"Browser navigated to {url}"],
+                        estimated_duration_minutes=1,
+                    )
+                    step = ExecutionStep(
+                        index=0,
+                        description=f"Navigate browser to {url}",
+                        tool="browser",
+                        action="navigate",
+                        parameters={"url": url},
+                        verification=f"Browser navigated to {url}",
+                        idempotent=True,
+                    )
+                    plan.steps.append(step)
+                    task.model_used = "deterministic_fast_path"
+                    return plan
+                else:
+                    plan = ExecutionPlan(
+                        objective=req,
+                        validation_criteria=[f"Application {app_name} is active in foreground"],
+                        estimated_duration_minutes=1,
+                    )
+                    step = ExecutionStep(
+                        index=0,
+                        description=f"Open or focus application '{app_name}'",
+                        tool="application",
+                        action="launch",
+                        parameters={"name": app_name},
+                        verification=f"Application {app_name} is visible and in foreground",
+                        idempotent=True,
+                    )
+                    plan.steps.append(step)
+                    task.model_used = "deterministic_fast_path"
+                    return plan
+
+        # 3. Simple typing: e.g. "type Hello World into Notepad", "type 'Hello World'"
+        m_type = re.match(r"^(?:type|write)\s+['\"]?(.+?)['\"]?(?:\s+(?:in|into|on)\s+([a-zA-Z0-9_\-\. ]+))?$", req, re.I)
+        if m_type:
+            text = m_type.group(1).strip()
+            target_app = (m_type.group(2) or "").strip()
+            plan = ExecutionPlan(
+                objective=req,
+                validation_criteria=[f"Text '{text}' entered into active editor"],
+                estimated_duration_minutes=1,
+            )
+            step_idx = 0
+            if target_app:
+                # Step 0: Ensure target app is launched/focused
+                plan.steps.append(
+                    ExecutionStep(
+                        index=step_idx,
+                        description=f"Focus or launch {target_app}",
+                        tool="application",
+                        action="launch",
+                        parameters={"name": target_app},
+                        verification=f"{target_app} in foreground",
+                        idempotent=True,
+                    )
+                )
+                step_idx += 1
+
+            plan.steps.append(
+                ExecutionStep(
+                    index=step_idx,
+                    description=f"Type text into target editor",
+                    tool="computer_use",
+                    action="type",
+                    parameters={"text": text},
+                    verification=f"Text '{text}' typed and verified",
+                    idempotent=False,
+                )
+            )
+            task.model_used = "deterministic_fast_path"
+            return plan
+
+        return None
 
     async def _generate_plan(self, task: Task) -> ExecutionPlan:
         """

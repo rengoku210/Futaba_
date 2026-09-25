@@ -950,54 +950,32 @@ class TaskManager:
                 self._journal.quarantine_task(task, "Stale active task without recovery checkpoint")
                 quarantined_count += 1
 
-        # Now resume recoverable user tasks
+        # Invariant 29: Startup MUST be quiet.
+        # Starting FUTABA must NOT execute old tasks, open Notepad, or perform UI actions.
+        # Recoverable tasks are restored into memory in PAUSED state requiring explicit user resumption.
         for task in recoverable_user:
             try:
                 recovery_step, checkpoint_data = task.get_recovery_point()
 
-                if task.state == TaskState.QUEUED:
-                    async with self._lock:
-                        self._active_tasks[task.task_id] = task
-                    await self._queue.enqueue(task)
-                    recovered.append(task)
-                    logger.info("Resumed recent queued user task %s: %s", task.task_id[:8], task.title)
-                    continue
-
-                if task.plan and recovery_step >= 0:
-                    for i, step in enumerate(task.plan.steps):
-                        if i > recovery_step and step.state == StepState.RUNNING:
-                            if step.idempotent:
-                                step.state = StepState.PENDING
-                                step.retries += 1
-                            else:
-                                step.state = StepState.PENDING
-                                logger.warning(
-                                    "Task %s step %d was non-idempotent and crashed mid-execution. Needs verification.",
-                                    task.task_id[:8], i
-                                )
-                    task.plan.current_step_index = recovery_step + 1
-
-                if task.state not in (TaskState.BLOCKED, TaskState.QUEUED):
-                    task.state = TaskState.RECOVERING
-                    task.state_history.append({
-                        "from": "crash",
-                        "to": TaskState.RECOVERING.value,
-                        "at": datetime.now(timezone.utc).isoformat(),
-                        "reason": "crash recovery",
-                    })
+                task.state = TaskState.PAUSED
+                task.state_history.append({
+                    "from": "prior_session",
+                    "to": TaskState.PAUSED.value,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "reason": "restored in quiet paused state on startup",
+                })
 
                 self._journal.save(task)
                 async with self._lock:
                     self._active_tasks[task.task_id] = task
-                await self._queue.enqueue(task, priority=2)
                 recovered.append(task)
-                logger.info("Recovered task %s from step %d: %s", task.task_id[:8], recovery_step, task.title)
+                logger.info("Restored task %s in quiet PAUSED state: %s", task.task_id[:8], task.title)
 
             except Exception as e:
-                logger.error("Failed to recover task %s: %s", task.task_id[:8], traceback.format_exc())
+                logger.error("Failed to restore task %s: %s", task.task_id[:8], traceback.format_exc())
 
         logger.info(
-            "Startup recovery summary: scanned=%d, recoverable_user_tasks=%d, stale_user_tasks=%d, test_tasks=%d, invalid_tasks=%d, resumed=%d, quarantined=%d",
+            "Startup recovery summary: scanned=%d, recoverable_user_tasks=%d, stale_user_tasks=%d, test_tasks=%d, invalid_tasks=%d, restored_paused=%d, quarantined=%d",
             scanned, len(recoverable_user), len(stale_user), len(test_tasks), len(invalid_tasks), len(recovered), quarantined_count
         )
 

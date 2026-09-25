@@ -602,7 +602,26 @@ class ApplicationTool(Tool):
                 return ToolResult(success=False, error=f"Failed to launch {path}: {e}")
 
         if name:
-            # Try Windows Start-Process
+            try:
+                from futaba.system.app_resolver import get_app_resolver
+                resolver = get_app_resolver()
+                res = resolver.open_or_focus(name)
+                if res.success:
+                    return ToolResult(
+                        success=True,
+                        output=res.message,
+                        metadata=res.to_dict(),
+                    )
+                else:
+                    return ToolResult(
+                        success=False,
+                        error=res.message,
+                        metadata=res.to_dict(),
+                    )
+            except Exception as e:
+                logger.debug("AppResolver in ApplicationTool error: %s, falling back to powershell", e)
+
+            # Fallback to Windows Start-Process
             terminal = TerminalTool()
             result = await terminal.execute(
                 "run_powershell",
